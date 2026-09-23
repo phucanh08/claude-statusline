@@ -34,6 +34,23 @@ bash install.sh
 Run from a file, the installer copies the `statusline-command.sh` next to it instead of
 downloading.
 
+## Uninstall
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/phucanh08/claude-statusline/main/uninstall.sh | bash
+```
+
+(or `bash uninstall.sh` from a clone). It only removes what the installer added:
+
+- `statusLine` is removed from `~/.claude/settings.json` only if it is exactly the value
+  above; any other `statusLine` is kept. All other keys are kept.
+- `~/.claude/statusline-command.sh` is removed only if it is identical to the released
+  script; a locally modified copy is kept.
+- `*.bak.*` backups are never restored or deleted — their paths are printed so you can
+  restore one by hand.
+
+Running it when nothing is installed does nothing.
+
 ## Options
 
 Flags such as `--width`, `--sections`, `--time` and `--layout` are passed in the
@@ -46,7 +63,7 @@ Flags such as `--width`, `--sections`, `--time` and `--layout` are passed in the
 sh test/run.sh
 ```
 
-All tests run against a throwaway `HOME` under `$TMPDIR`; `curl` and `security` are
+Tests cover both install.sh and uninstall.sh. All tests run against a throwaway `HOME` under `$TMPDIR`; `curl` and `security` are
 stubbed so nothing touches the network or the Keychain. The reference copy compared
 against is your own `~/.claude/statusline-command.sh`, which is only read.
 
