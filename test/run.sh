@@ -130,6 +130,76 @@ echo "7. syntax (shellcheck not installed: skipped)"
 check "sh -n install.sh" 'sh -n "$REPO/install.sh"'
 check "bash -n install.sh" 'bash -n "$REPO/install.sh"'
 
+uninstall_from() { HOME="$1" PATH="$BASE_PATH" bash "$REPO/uninstall.sh" >"$WORK/out" 2>&1; }
+seed_settings() {
+    mkdir -p "$1/.claude"
+    echo '{"theme":"dark","permissions":{"allow":["Bash(ls:*)"]},"env":{"FOO":"bar"}}' > "$1/.claude/settings.json"
+}
+
+echo "U7. install -> uninstall removes exactly what install added"
+H=$(new_home u7); seed_settings "$H"
+cp "$H/.claude/settings.json" "$WORK/settings.orig"
+install_into "$H"
+uninstall_from "$H"; rc=$?
+check "uninstaller exits 0" '[ "$rc" -eq 0 ]'
+check "statusLine key gone" '[ "$(jq "has(\"statusLine\")" "$H/.claude/settings.json")" = false ]'
+check "other keys intact" '[ "$(jq -S . "$H/.claude/settings.json")" = "$(jq -S . "$WORK/settings.orig")" ]'
+check "script removed" '[ ! -e "$H/.claude/statusline-command.sh" ]'
+check "backup paths printed, backups kept" 'grep -q "settings.json.bak." "$WORK/out" && ls "$H"/.claude/settings.json.bak.* >/dev/null 2>&1'
+
+echo "U8. user-modified script is kept"
+H=$(new_home u8)
+install_into "$H"
+echo '# my tweak' >> "$H/.claude/statusline-command.sh"
+cp "$H/.claude/statusline-command.sh" "$WORK/script.mod"
+uninstall_from "$H"; rc=$?
+check "uninstaller exits 0" '[ "$rc" -eq 0 ]'
+check "script kept unchanged" 'cmp -s "$H/.claude/statusline-command.sh" "$WORK/script.mod"'
+check "says it kept the script" 'grep -q "Kept .*statusline-command.sh" "$WORK/out"'
+
+echo "U9. a different statusLine command is kept"
+H=$(new_home u9); mkdir -p "$H/.claude"
+echo '{"theme":"dark","statusLine":{"type":"command","command":"sh ~/.claude/statusline-command.sh --width 20"}}' > "$H/.claude/settings.json"
+cp "$H/.claude/settings.json" "$WORK/settings.orig"
+uninstall_from "$H"; rc=$?
+check "uninstaller exits 0" '[ "$rc" -eq 0 ]'
+check "settings.json unchanged" 'cmp -s "$H/.claude/settings.json" "$WORK/settings.orig"'
+check "says it kept statusLine" 'grep -q "Kept statusLine" "$WORK/out"'
+
+echo "U10. clean HOME and second run are no-ops"
+H=$(new_home u10)
+uninstall_from "$H"; rc=$?
+check "clean HOME: exits 0" '[ "$rc" -eq 0 ]'
+check "clean HOME: nothing created" '[ -z "$(ls -A "$H")" ]'
+H=$(new_home u10b); seed_settings "$H"
+install_into "$H"; uninstall_from "$H"
+before=$(snapshot "$H")
+uninstall_from "$H"; rc=$?
+check "second run: exits 0" '[ "$rc" -eq 0 ]'
+check "second run: nothing changed" '[ "$before" = "$(snapshot "$H")" ]'
+
+echo "U11. jq missing -> clear error, nothing touched"
+H=$(new_home u11)
+install_into "$H"
+before=$(snapshot "$H")
+HOME="$H" PATH="$NOJQ" "$NOJQ/bash" "$REPO/uninstall.sh" >"$WORK/out" 2>&1; rc=$?
+check "fails non-zero" '[ "$rc" -ne 0 ]'
+check "message names jq" 'grep -q "jq is required" "$WORK/out"'
+check "files unchanged" '[ "$before" = "$(snapshot "$H")" ]'
+
+echo "U-piped. piped uninstall (curl | bash) compares against the downloaded script"
+H=$(new_home up)
+install_into "$H"
+: > "$WORK/fetch.log"
+(cd "$WORK" && HOME="$H" PATH="$FETCH:$BASE_PATH" bash < "$REPO/uninstall.sh" >"$WORK/out" 2>&1); rc=$?
+check "uninstaller exits 0" '[ "$rc" -eq 0 ]'
+check "fetched from raw.githubusercontent.com" 'grep -q "raw.githubusercontent.com/phucanh08/claude-statusline/main/statusline-command.sh" "$WORK/fetch.log"'
+check "script removed" '[ ! -e "$H/.claude/statusline-command.sh" ]'
+
+echo "U12. syntax (shellcheck not installed: skipped)"
+check "sh -n uninstall.sh" 'sh -n "$REPO/uninstall.sh"'
+check "bash -n uninstall.sh" 'bash -n "$REPO/uninstall.sh"'
+
 echo "guard: no network / Keychain calls"
 check "curl/security stubs never called" '[ ! -s "$NET_LOG" ]'
 [ -s "$NET_LOG" ] && cat "$NET_LOG"
