@@ -57,6 +57,30 @@ Flags such as `--width`, `--sections`, `--time` and `--layout` are passed in the
 `statusLine.command` string in `settings.json`; see the header of
 `statusline-command.sh` for the full list.
 
+## Privacy / network
+
+The status line itself only reads the JSON Claude Code pipes into it — with one exception.
+Model-scoped quotas (e.g. a Fable weekly limit) are not in that payload, so the script keeps
+a small usage cache and refreshes it in the background:
+
+- **Cache:** `~/.cache/claude-statusline/usage.json`. It is refreshed when missing or older
+  than **90 seconds**; the script never waits on it — every render uses whatever is cached.
+- **Credential:** the refresh reads your Claude Code OAuth token from the macOS Keychain with
+  `security find-generic-password -s "Claude Code-credentials" -w`. The token is only held
+  in that background job; it is not written to disk.
+- **Request:** `curl -s -m 5` (5-second timeout) with that token as a Bearer header to
+  `https://api.anthropic.com/api/oauth/usage` — the same usage data `/usage` shows. The
+  response replaces the cache only if it is valid JSON with a `limits` array; on any error
+  the old cache is kept. At most one refresh runs at a time (lock dir
+  `~/.cache/claude-statusline/refresh.lock`).
+- **Non-macOS / no token:** if the `security` command is missing or the Keychain has no
+  Claude Code token, no request is made. The cache directory is still created, and the
+  quota fields fall back to what the payload provides.
+
+**Opting out:** the script has no option for this. Leaving `fable` out of `--sections` hides
+the bar but does **not** stop the refresh. To avoid the Keychain read and the request you
+would have to edit the script yourself.
+
 ## Tests
 
 ```sh
