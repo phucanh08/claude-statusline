@@ -196,6 +196,16 @@ check "uninstaller exits 0" '[ "$rc" -eq 0 ]'
 check "fetched from raw.githubusercontent.com" 'grep -q "raw.githubusercontent.com/phucanh08/claude-statusline/main/statusline-command.sh" "$WORK/fetch.log"'
 check "script removed" '[ ! -e "$H/.claude/statusline-command.sh" ]'
 
+echo "U-invalid. settings.json not a JSON object -> refuse, nothing touched"
+H=$(new_home uinv)
+install_into "$H"
+echo '["not", "an", "object"]' > "$H/.claude/settings.json"
+before=$(snapshot "$H")
+uninstall_from "$H"; rc=$?
+check "fails non-zero" '[ "$rc" -ne 0 ]'
+check "message names settings.json" 'grep -q "not a valid JSON object" "$WORK/out"'
+check "files unchanged (script kept too)" '[ "$before" = "$(snapshot "$H")" ]'
+
 echo "U12. syntax (shellcheck not installed: skipped)"
 check "sh -n uninstall.sh" 'sh -n "$REPO/uninstall.sh"'
 check "bash -n uninstall.sh" 'bash -n "$REPO/uninstall.sh"'
