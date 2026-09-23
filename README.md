@@ -61,7 +61,7 @@ Flags such as `--width`, `--sections`, `--time` and `--layout` are passed in the
 
 | Platform | Status line | Install / uninstall | Usage refresh credential |
 |---|---|---|---|
-| macOS | yes | `curl … \| bash` | Keychain |
+| macOS | yes | `curl … \| bash` | Keychain, else `~/.claude/.credentials.json` |
 | Linux (glibc or busybox/musl) | yes | `curl … \| bash` (needs `bash`) | `~/.claude/.credentials.json` |
 | Windows, WSL | yes (it is Linux) | run inside WSL | the WSL `~/.claude/.credentials.json` |
 | Windows, native with Git for Windows | yes, via Git Bash | run the one-liner in Git Bash | `%USERPROFILE%\.claude\.credentials.json` |
@@ -77,15 +77,15 @@ Notes:
   A native `jq.exe` writes CRLF line endings; the script detects that under Git Bash and
   passes it `-b` (`statusline-command.sh:89-91`), which needs jq 1.7 or newer.
 - **Dates and file ages** use `date -r`/`stat -f` on macOS and `date -d @`/`stat -c` on
-  GNU, busybox and Git Bash (`statusline-command.sh:158-162`, `:310-312`), so reset
+  GNU, busybox and Git Bash (`statusline-command.sh:159-163`, `:314-316`), so reset
   times and the cache age are the same on every platform. On macOS the output is
   byte-identical to earlier releases (checked by the test suite).
 - **Locale:** the script sets `LC_ALL=en_US.UTF-8` and falls back to `C.UTF-8` where
   that locale is not installed, so column widths count characters, not bytes
   (`statusline-command.sh:84-87`).
 - **`CLAUDE_CONFIG_DIR`:** the install and uninstall scripts always use `~/.claude`. The
-  usage refresh on Linux/Windows honors `CLAUDE_CONFIG_DIR` when looking for the
-  credentials file; on macOS it reads the default Keychain entry only.
+  usage refresh honors `CLAUDE_CONFIG_DIR` when looking for the credentials file; on
+  macOS it still reads only the default Keychain entry (see below).
 
 ## Privacy / network
 
@@ -93,31 +93,38 @@ The status line itself only reads the JSON Claude Code pipes into it — with on
 Model-scoped quotas (e.g. a Fable weekly limit) are not in that payload, so the script keeps
 a small usage cache and refreshes it in the background:
 
-- **Cache:** `~/.cache/claude-statusline/usage.json` (`statusline-command.sh:155-156`). It
-  is refreshed when missing or older than **90 seconds** (`:154`, `:191-193`); the script
+- **Cache:** `~/.cache/claude-statusline/usage.json` (`statusline-command.sh:156-157`). It
+  is refreshed when missing or older than **90 seconds** (`:155`, `:195-197`); the script
   never waits on it — every render uses whatever is cached.
-- **Credential — macOS:** the refresh reads your Claude Code OAuth token from the Keychain
-  with `security find-generic-password -s "Claude Code-credentials" -w`
-  (`statusline-command.sh:170-172`). The credentials file is not read on macOS.
+- **Credential — macOS:** the refresh first reads your Claude Code OAuth token from the
+  Keychain with `security find-generic-password -s "Claude Code-credentials" -w`
+  (`statusline-command.sh:172-177`). Only if that yields no token does it read the
+  credentials file below (`:180-181`) — where Claude Code keeps your login when the
+  Keychain rejects the write, e.g. when it is locked in an SSH session.
 - **Credential — Linux, WSL, Windows (Git Bash):** the refresh reads
   `.claudeAiOauth.accessToken` from `~/.claude/.credentials.json`, or from
   `$CLAUDE_CONFIG_DIR/.credentials.json` when that variable is set
-  (`statusline-command.sh:173-177`) — the file Claude Code itself keeps its login in on
+  (`statusline-command.sh:180-181`) — the file Claude Code itself keeps its login in on
   those systems. It never writes to that file.
+- **`CLAUDE_CONFIG_DIR` on macOS:** Claude Code keys its Keychain entry to that directory,
+  but its docs do not say under what name, so the script still looks up only
+  `Claude Code-credentials` (`:175`). With the variable set, a login that lives in the
+  Keychain may therefore not be found; a login in `$CLAUDE_CONFIG_DIR/.credentials.json`
+  is.
 - **Token handling (all platforms):** the token is only held in the background job; it is
-  not written to disk (`statusline-command.sh:169-189`). It is passed to `curl` as a
+  not written to disk (`statusline-command.sh:170-193`). It is passed to `curl` as a
   command-line argument, so it is visible in the process list for the few seconds the
   request runs.
 - **Request:** `curl -s -m 5` (5-second timeout) with that token as a Bearer header to
   `https://api.anthropic.com/api/oauth/usage` — the same usage data `/usage` shows
-  (`statusline-command.sh:180-181`). The response replaces the cache only if it is valid
-  JSON with a `limits` array; on any error the old cache is kept (`:182-186`). At most one
-  refresh runs at a time (lock dir `~/.cache/claude-statusline/refresh.lock`, `:165-168`;
+  (`statusline-command.sh:184-185`). The response replaces the cache only if it is valid
+  JSON with a `limits` array; on any error the old cache is kept (`:186-190`). At most one
+  refresh runs at a time (lock dir `~/.cache/claude-statusline/refresh.lock`, `:166-169`;
   a lock older than 30 seconds is treated as left over and cleared).
-- **No token:** if there is no token — `security` missing or the Keychain has no Claude
-  Code entry on macOS, no credentials file or no `accessToken` in it elsewhere — no
-  request is made (`statusline-command.sh:178`). The cache directory is still created, and
-  the quota fields fall back to what the payload provides.
+- **No token:** if neither source has a token — on macOS no Keychain entry (or no
+  `security`) and no usable credentials file, elsewhere no credentials file or no
+  `accessToken` in it — no request is made (`statusline-command.sh:182`). The cache
+  directory is still created, and the quota fields fall back to what the payload provides.
 
 **Opting out:** the script has no option for this. Leaving `fable` out of `--sections` hides
 the bar but does **not** stop the refresh. To avoid the credential read and the request you
@@ -131,13 +138,15 @@ sh test/run.sh
 
 Tests cover install.sh, uninstall.sh and the status line script. All tests run against a
 throwaway `HOME` under `$TMPDIR`; `curl`, `security` (and, for the credential tests,
-`uname`) are stubbed so nothing touches the network, the Keychain or your real
+`uname` and a logging `jq`) are stubbed so nothing touches the network, the Keychain or your real
 `~/.claude`. Status line output is compared byte for byte against `test/golden/*.out`,
 recorded on macOS from the `09f538a` release; on macOS the suite also renders that
 release from git history (so a clone needs full history) and compares live.
 
-The suite runs in GitHub Actions on Ubuntu, macOS and Windows (Git Bash) —
-`.github/workflows/test.yml`.
+The suite runs in GitHub Actions on Ubuntu, macOS and Windows (Git Bash), the latter
+once with `core.autocrlf=false` and once with `true` —
+`.github/workflows/test.yml`. `.gitattributes` keeps every file LF on checkout, so a
+Windows clone with Git's default `core.autocrlf=true` still passes.
 
 ## License
 
