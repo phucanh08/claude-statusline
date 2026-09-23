@@ -1,0 +1,3 @@
+# Scripts and test/golden/*.out are compared byte for byte: keep LF on every checkout,
+# whatever core.autocrlf says (no binary files in the repo).
+* text eol=lf
