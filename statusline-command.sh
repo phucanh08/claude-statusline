@@ -81,7 +81,14 @@ case "$LAYOUT" in expanded|compact) ;; *) LAYOUT="expanded" ;; esac      # guard
 
 input=$(cat)
 ESC=$(printf '\033')
-export LC_ALL=en_US.UTF-8
+export LC_ALL=en_US.UTF-8 2>/dev/null
+# Minimal Linux images ship no en_US locale; C.UTF-8 keeps ${#var} counting
+# characters (not bytes) there, so the columns still line up.
+_u='·'; [ "${#_u}" -eq 1 ] || export LC_ALL=C.UTF-8 2>/dev/null
+# A native jq.exe under Git Bash / Cygwin ends lines with CRLF unless given -b.
+case "$OSTYPE" in msys*|cygwin*)
+    case "$(jq -n 1 2>/dev/null)" in *"$(printf '\r')"*) jq() { command jq -b "$@"; } ;; esac ;;
+esac
 
 # ---- context window (tokens) ----
 total_input=$(printf '%s' "$input"  | jq -r '.context_window.total_input_tokens // 0')
@@ -141,20 +148,33 @@ fi
 #   - render ONLY from a local cache file (never blocks on the network);
 #   - when the cache is older than USAGE_TTL, refresh it in a detached background
 #     job (5s timeout, one refresher at a time via a lock dir);
-#   - on any error the old cache is kept. The OAuth token is read from the macOS
-#     Keychain only inside that job and is never written anywhere.
+#   - on any error the old cache is kept. The OAuth token is read only inside that
+#     job and is never written anywhere: from the Keychain on macOS, elsewhere from
+#     the credentials file Claude Code keeps in its config dir (no file, no request).
 USAGE_TTL=90
 USAGE_DIR="$HOME/.cache/claude-statusline"
 USAGE_CACHE="$USAGE_DIR/usage.json"
+# File mtime as epoch seconds: GNU/busybox/Git Bash `stat -c`, else BSD `stat -f`; 0 if unknown.
+mtime() {
+    _m=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null)
+    case "$_m" in ""|*[!0-9]*) _m=0 ;; esac
+    printf '%s' "$_m"
+}
 usage_refresh() {
     mkdir -p "$USAGE_DIR" 2>/dev/null || return
     lock="$USAGE_DIR/refresh.lock"
     # Clear a lock left behind by a killed job (older than 30s).
-    [ -d "$lock" ] && [ $(( $(date +%s) - $(stat -f %m "$lock" 2>/dev/null || echo 0) )) -gt 30 ] && rmdir "$lock" 2>/dev/null
+    [ -d "$lock" ] && [ $(( $(date +%s) - $(mtime "$lock") )) -gt 30 ] && rmdir "$lock" 2>/dev/null
     mkdir "$lock" 2>/dev/null || return
     (
-        tok=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null \
-              | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
+        if [ "$(uname -s 2>/dev/null)" = Darwin ]; then
+            tok=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null \
+                  | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
+        else
+            # Linux, WSL, Git Bash: ~/.claude/.credentials.json, or under $CLAUDE_CONFIG_DIR.
+            tok=$(jq -r '.claudeAiOauth.accessToken // empty' \
+                  "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json" 2>/dev/null)
+        fi
         if [ -n "$tok" ]; then
             tmp="$USAGE_CACHE.$$"
             if curl -s -m 5 -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" \
@@ -169,7 +189,7 @@ usage_refresh() {
     ) >/dev/null 2>&1 &
 }
 cache_age=999999
-[ -f "$USAGE_CACHE" ] && cache_age=$(( $(date +%s) - $(stat -f %m "$USAGE_CACHE" 2>/dev/null || echo 0) ))
+[ -f "$USAGE_CACHE" ] && cache_age=$(( $(date +%s) - $(mtime "$USAGE_CACHE") ))
 [ "$cache_age" -gt "$USAGE_TTL" ] && usage_refresh
 # Payload bucket (above) wins; otherwise use the cached model-scoped weekly limit.
 # A "Fable" scope is preferred; any other model scope is shown under its own name.
@@ -286,6 +306,10 @@ fmtctx() {
     elif [ "$n" -ge 1000 ];    then echo "$(( n / 1000 ))K"
     else echo "$n"; fi
 }
+# An epoch in local time as $2 (a date format): BSD `date -r`, else GNU/busybox `date -d @`.
+fmt_epoch() {
+    date -r "$1" +"$2" 2>/dev/null || date -d "@$1" +"$2" 2>/dev/null
+}
 # A signed "HH:MM" clock for a duration in seconds.  $1=seconds (clamped >=0) $2=sign
 clock_hm() {
     s=$1; [ "$s" -lt 0 ] && s=0
@@ -312,7 +336,7 @@ fh_field() {
     rem=$(( $1 - $2 ))
     [ "$rem" -le 0 ] && { awaiting; return; }
     case "$TMODE" in
-        reset)     printf ' @%s' "$(date -r "$1" +"$TIMEFMT" 2>/dev/null)" ;;
+        reset)     printf ' @%s' "$(fmt_epoch "$1" "$TIMEFMT")" ;;
         remaining) printf ' %s'  "$(clock_hm "$rem" '-')" ;;
         elapsed)   printf ' %s'  "$(clock_hm "$(( FH_LEN - rem ))" '+')" ;;
     esac
@@ -322,7 +346,7 @@ wk_field() {
     rem=$(( $1 - $2 ))
     [ "$rem" -le 0 ] && { awaiting; return; }
     case "$TMODE" in
-        reset)     printf ' @%s' "$(date -r "$1" +"$DATEFMT" 2>/dev/null)" ;;
+        reset)     printf ' @%s' "$(fmt_epoch "$1" "$DATEFMT")" ;;
         remaining) if [ "$rem" -ge 86400 ]; then printf ' %s' "$(day_hm "$rem" '-')"
                    else printf ' %s' "$(clock_hm "$rem" '-')"; fi ;;
         elapsed)   el=$(( WK_LEN - rem )); [ "$el" -lt 0 ] && el=0
