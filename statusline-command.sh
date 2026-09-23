@@ -149,8 +149,9 @@ fi
 #   - when the cache is older than USAGE_TTL, refresh it in a detached background
 #     job (5s timeout, one refresher at a time via a lock dir);
 #   - on any error the old cache is kept. The OAuth token is read only inside that
-#     job and is never written anywhere: from the Keychain on macOS, elsewhere from
-#     the credentials file Claude Code keeps in its config dir (no file, no request).
+#     job and is never written anywhere: on macOS from the Keychain, then (no token
+#     there) from the credentials file Claude Code keeps in its config dir, which is
+#     the only source elsewhere (neither, no request).
 USAGE_TTL=90
 USAGE_DIR="$HOME/.cache/claude-statusline"
 USAGE_CACHE="$USAGE_DIR/usage.json"
@@ -167,14 +168,17 @@ usage_refresh() {
     [ -d "$lock" ] && [ $(( $(date +%s) - $(mtime "$lock") )) -gt 30 ] && rmdir "$lock" 2>/dev/null
     mkdir "$lock" 2>/dev/null || return
     (
+        tok=""
         if [ "$(uname -s 2>/dev/null)" = Darwin ]; then
+            # Service name as Claude Code uses it without CLAUDE_CONFIG_DIR; with it set the
+            # entry is keyed to that dir under a name the docs do not give, so only the file covers it.
             tok=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null \
                   | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
-        else
-            # Linux, WSL, Git Bash: ~/.claude/.credentials.json, or under $CLAUDE_CONFIG_DIR.
-            tok=$(jq -r '.claudeAiOauth.accessToken // empty' \
-                  "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json" 2>/dev/null)
         fi
+        # Linux, WSL, Git Bash, and macOS when the Keychain has no token (Claude Code writes
+        # here when the Keychain rejects the write): .credentials.json in the config dir.
+        [ -n "$tok" ] || tok=$(jq -r '.claudeAiOauth.accessToken // empty' \
+                  "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json" 2>/dev/null)
         if [ -n "$tok" ]; then
             tmp="$USAGE_CACHE.$$"
             if curl -s -m 5 -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" \

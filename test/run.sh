@@ -27,6 +27,7 @@ case "$(uname -s)" in
     *) OS=linux ;;
 esac
 echo "platform: $OS ($(uname -s))"
+REAL_JQ=$(command -v jq)   # before the Git Bash wrapper below shadows the name
 # A native jq.exe under Git Bash ends lines with CRLF unless given -b.
 if [ "$OS" = windows ]; then
     case "$(jq -n 1)" in *"$(printf '\r')"*) jq() { command jq -b "$@"; } ;; esac
@@ -281,9 +282,12 @@ check "bash -n uninstall.sh" 'bash -n "$REPO/uninstall.sh"'
 
 # ---- usage refresh: which credential is read, and when a request is made ----
 # Own stubs: `uname` fakes the OS, `security` serves $SEC_TOKEN from a fake Keychain,
-# `curl` logs its arguments (outside the fake HOME) and writes $CURL_BODY to -o.
+# `curl` logs its arguments (outside the fake HOME) and writes $CURL_BODY to -o, `jq`
+# logs its arguments to $JQ_LOG (shows whether the credentials file is read) and runs
+# the real jq.
 CRED="$WORK/cred-bin"; mkdir -p "$CRED"
 CRED_LOG="$WORK/cred.log"
+JQ_LOG="$WORK/jq.log"
 cat > "$CRED/uname" <<'EOF'
 #!/bin/sh
 echo "$FAKE_UNAME"
@@ -300,13 +304,18 @@ echo "curl \$*" >> "$CRED_LOG"
 while [ \$# -gt 0 ]; do [ "\$1" = "-o" ] && out="\$2"; shift; done
 printf '%s' "\$CURL_BODY" > "\$out"
 EOF
-chmod +x "$CRED/uname" "$CRED/security" "$CRED/curl"
+cat > "$CRED/jq" <<EOF
+#!/bin/sh
+echo "jq \$*" >> "$JQ_LOG"
+exec "$REAL_JQ" "\$@"
+EOF
+chmod +x "$CRED/uname" "$CRED/security" "$CRED/curl" "$CRED/jq"
 NEW_BODY='{"limits":[{"kind":"session","percent":7}]}'
 # refresh HOME OS [VAR=value ...]: render once with a stale/missing cache, then wait
 # for the background refresh to drop its lock.
 refresh() {
     _h="$1"; _os="$2"; shift 2
-    mkdir -p "$_h/tmp"; : > "$CRED_LOG"
+    mkdir -p "$_h/tmp"; : > "$CRED_LOG"; : > "$JQ_LOG"
     echo '{"model":{"display_name":"Opus 5.5"}}' | (cd "$_h" && env HOME="$_h" TMPDIR="$_h/tmp" \
         FAKE_UNAME="$_os" SEC_TOKEN="" CURL_BODY="$NEW_BODY" CLAUDE_CONFIG_DIR= "$@" \
         PATH="$CRED:$BASE_PATH" bash "$SCRIPT") > /dev/null
@@ -323,17 +332,20 @@ H=$(new_home c1); creds "$H/.claude" tok-file-c1
 refresh "$H" Darwin SEC_TOKEN=tok-mac-c1
 check "security queried for Claude Code-credentials" 'grep -q "^security find-generic-password -s Claude Code-credentials -w" "$CRED_LOG"'
 check "curl sent the Keychain token" 'grep -q "Authorization: Bearer tok-mac-c1" "$CRED_LOG"'
-check "credentials file not used on macOS" '! grep -q tok-file-c1 "$CRED_LOG"'
+check "credentials file token not sent" '! grep -q tok-file-c1 "$CRED_LOG"'
+check "credentials file not read" '! grep -q "credentials\.json" "$JQ_LOG"'
 check "curl has 5s timeout" 'grep -q "^curl -s -m 5 " "$CRED_LOG"'
 check "cache replaced by the response" '[ "$(cat "$H/$CACHE")" = "$NEW_BODY" ]'
 check "token in no file under HOME" '[ -z "$(leaks "$H" tok-mac-c1)" ]'
 
-echo "C2. macOS: no Keychain token -> no request"
+echo "C2. macOS: no Keychain token -> ~/.claude/.credentials.json, never stored"
 H=$(new_home c2); creds "$H/.claude" tok-file-c2
 refresh "$H" Darwin
-check "security queried" 'grep -q "^security " "$CRED_LOG"'
-check "curl never called" '! grep -q "^curl" "$CRED_LOG"'
-check "no cache written" '[ ! -e "$H/$CACHE" ]'
+check "security queried first" '[ "$(head -1 "$CRED_LOG" | cut -d" " -f1)" = security ]'
+check "credentials file read" 'grep -q "$H/.claude/.credentials.json" "$JQ_LOG"'
+check "curl sent the file token" 'grep -q "Authorization: Bearer tok-file-c2" "$CRED_LOG"'
+check "cache replaced by the response" '[ "$(cat "$H/$CACHE")" = "$NEW_BODY" ]'
+check "token in no file under HOME" '[ -z "$(leaks "$H" tok-file-c2)" ]'
 
 echo "C3. Linux: token from ~/.claude/.credentials.json, never stored"
 H=$(new_home c3); creds "$H/.claude" tok-linux-c3
@@ -387,6 +399,23 @@ check "fresh lock: curl never called" '[ ! -s "$CRED_LOG" ]'
 touch -t 200001010000 "$H/.cache/claude-statusline/refresh.lock"
 refresh "$H" Linux
 check "stale lock: cleared and refresh ran" 'grep -q "Authorization: Bearer tok-c8" "$CRED_LOG" && [ ! -d "$H/.cache/claude-statusline/refresh.lock" ]'
+
+echo "C9. macOS: no Keychain token, no credentials file / no token -> no request"
+H=$(new_home c9a)
+refresh "$H" Darwin
+check "security queried" 'grep -q "^security " "$CRED_LOG"'
+check "missing file: curl never called" '! grep -q "^curl" "$CRED_LOG"'
+check "no cache written" '[ ! -e "$H/$CACHE" ]'
+H=$(new_home c9b); mkdir -p "$H/.claude"; echo '{"claudeAiOauth":{}}' > "$H/.claude/.credentials.json"
+refresh "$H" Darwin
+check "file without accessToken: curl never called" '! grep -q "^curl" "$CRED_LOG"'
+
+echo "C10. macOS: CLAUDE_CONFIG_DIR moves the fallback credentials file"
+H=$(new_home c10); creds "$H/.claude" tok-home-c10; creds "$H/cfg" tok-cfg-c10
+refresh "$H" Darwin CLAUDE_CONFIG_DIR="$H/cfg"
+check "curl sent the CLAUDE_CONFIG_DIR token" 'grep -q "Authorization: Bearer tok-cfg-c10" "$CRED_LOG"'
+check "~/.claude token not used" '! grep -q tok-home-c10 "$CRED_LOG"'
+check "token in no file under HOME" '[ -z "$(leaks "$H" tok-cfg-c10)" ]'
 
 echo "guard: no network / Keychain calls"
 check "curl/security stubs never called" '[ ! -s "$NET_LOG" ]'
