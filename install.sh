@@ -20,7 +20,7 @@ main() {
 
     if ! command -v jq >/dev/null 2>&1; then
         echo "claude-statusline: jq is required but was not found in PATH." >&2
-        echo "Install it first (e.g. 'brew install jq' or 'sudo apt install jq'), then re-run." >&2
+        echo "Install it first (e.g. 'brew install jq', 'sudo apt install jq' or 'winget install jqlang.jq'), then re-run." >&2
         exit 1
     fi
 
