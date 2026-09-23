@@ -1,0 +1,5 @@
+{
+  "model": { "display_name": "Sonnet 5" },
+  "effort": { "level": "auto" },
+  "context_window": { "total_input_tokens": 0, "total_output_tokens": 0, "context_window_size": 200000 }
+}

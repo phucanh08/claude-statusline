@@ -1,0 +1,5 @@
+{
+  "model": { "display_name": "Opus 5.5" },
+  "effort": { "level": "max" },
+  "context_window": { "total_input_tokens": 120000, "total_output_tokens": 3000, "context_window_size": 200000 }
+}

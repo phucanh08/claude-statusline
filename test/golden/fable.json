@@ -1,0 +1,11 @@
+{
+  "model": { "display_name": "Fable 5.1 (1M context)" },
+  "effort": { "level": "xhigh" },
+  "cost": { "total_cost_usd": 12.5 },
+  "context_window": { "total_input_tokens": 708000, "total_output_tokens": 12000, "context_window_size": 1000000 },
+  "rate_limits": {
+    "five_hour": { "used_percentage": 99.4, "resets_at": 4102461000 },
+    "seven_day": { "used_percentage": 3, "resets_at": 4102531200 },
+    "seven_day_fable": { "used_percentage": 63, "resets_at": 4103136000 }
+  }
+}
