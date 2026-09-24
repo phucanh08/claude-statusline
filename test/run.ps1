@@ -42,12 +42,21 @@ function JqCanon([string]$Filter, [string]$File) { (& $Jq -S -a -c $Filter $File
 function New-Home([string]$Name) {
     $h = Join-Path $Work "home.$Name"; $null = New-Item -ItemType Directory -Path $h; $h
 }
-# Path, SHA-256 and mtime of every file under a directory.
+# The PowerShell host itself writes under USERPROFILE (caches, profile data); the top-level
+# entries it creates in an empty home are measured once below and left out of the checks.
+$script:HostEntries = @()
+function Owned-Items([string]$Dir) {
+    @(Get-ChildItem -LiteralPath $Dir -Force | Where-Object { $script:HostEntries -notcontains $_.Name })
+}
+# Path of every directory, plus SHA-256 and mtime of every file, under a directory.
 function Snapshot([string]$Dir) {
-    $files = @(Get-ChildItem -LiteralPath $Dir -Recurse -File -Force | Sort-Object FullName)
-    ($files | ForEach-Object {
-        $sha = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($_.FullName)))
-        "$($_.FullName.Substring($Dir.Length)) $sha $($_.LastWriteTimeUtc.Ticks)"
+    $items = @(Owned-Items $Dir | ForEach-Object { $_; if ($_.PSIsContainer) { Get-ChildItem -LiteralPath $_.FullName -Recurse -Force } })
+    ($items | Sort-Object FullName | ForEach-Object {
+        $rel = $_.FullName.Substring($Dir.Length)
+        if ($_.PSIsContainer) { "$rel/" } else {
+            $sha = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($_.FullName)))
+            "$rel $sha $($_.LastWriteTimeUtc.Ticks)"
+        }
     }) -join "`n"
 }
 function Same-Bytes([string]$A, [string]$B) {
@@ -56,7 +65,11 @@ function Same-Bytes([string]$A, [string]$B) {
 function Has-Bom([string]$File) {
     $b = [IO.File]::ReadAllBytes($File); $b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF
 }
-function Is-Empty([string]$Dir) { @(Get-ChildItem -LiteralPath $Dir -Force).Count -eq 0 }
+function Is-Empty([string]$Dir) {
+    $left = Owned-Items $Dir
+    if ($left.Count) { Write-Host "       (found: $(($left | ForEach-Object { $_.Name }) -join ', '))" }
+    $left.Count -eq 0
+}
 # First file named $Name (any PATHEXT extension) in a PATH string, or $null.
 function Find-OnPath([string]$PathString, [string]$Name) {
     foreach ($d in $PathString.Split(';')) {
@@ -71,7 +84,11 @@ function Find-OnPath([string]$PathString, [string]$Name) {
 
 # Child process body. Invoke-WebRequest/Invoke-RestMethod are shadowed by functions: every
 # call is logged; only a test that sets CSL_SERVE gets a file back (the repo script).
+# The console runs in code page 437, as a stock US/Western Windows console does, so output
+# decoded in the console code page instead of UTF-8 shows up.
 $ChildBody = @'
+try { [Console]::OutputEncoding = [Text.Encoding]::GetEncoding(437) } catch { }
+Write-Output "CSL-CODEPAGE $([Console]::OutputEncoding.CodePage)"
 function Invoke-WebRequest { param([string]$Uri, [string]$OutFile, [switch]$UseBasicParsing)
     Add-Content -LiteralPath $env:CSL_NET_LOG -Value "Invoke-WebRequest $Uri"
     if (-not $env:CSL_SERVE) { throw 'network disabled in tests' }
@@ -121,6 +138,15 @@ function Install-Into([string]$H, [hashtable]$Overrides = @{}, [switch]$Piped, [
 Write-Host "host: $HostExe (PowerShell $($PSVersionTable.PSVersion))"
 Write-Host "installer: $Installer"
 Write-Host "jq: $Jq"
+
+Write-Host '0. what the bare PowerShell host writes under USERPROFILE (ignored below)'
+$noop = Join-Path $Work 'noop.ps1'; [IO.File]::WriteAllText($noop, "exit 0`n")
+$ctrl = New-Home control
+Install-Into $ctrl @{ CSL_INSTALLER = $noop }; Install-Into $ctrl @{ CSL_INSTALLER = $noop }
+$script:HostEntries = @(Get-ChildItem -LiteralPath $ctrl -Force | ForEach-Object { $_.Name })
+Write-Host "       host entries: $(if ($HostEntries.Count) { $HostEntries -join ', ' } else { '(none)' })"
+Check 'the host never creates .claude (precondition)' { $HostEntries -notcontains '.claude' }
+Check 'child console runs in code page 437 (precondition)' { $out.Contains('CSL-CODEPAGE 437') }
 
 Write-Host '1. fresh install from a local checkout'
 $H = New-Home 1
@@ -246,22 +272,22 @@ Check "CLAUDE_CODE_GIT_BASH_PATH to Git's bash.exe: installs" { $rc -eq 0 -and (
 
 Write-Host '7. piped install (irm | iex) downloads from raw.githubusercontent.com'
 $H = New-Home 7
-Set-Content -LiteralPath $NetLog -Value $null
-Install-Into $H @{ CSL_SERVE = $RepoScript } -Piped
+$log7 = Join-Path $Work 'net7.log'; $null = New-Item -ItemType File -Path $log7
+Install-Into $H @{ CSL_SERVE = $RepoScript; CSL_NET_LOG = $log7 } -Piped
 Check 'installer exits 0' { $rc -eq 0 }
-Check 'downloaded from main on raw.githubusercontent.com' { @(Get-Content -LiteralPath $NetLog) -ccontains "Invoke-WebRequest $RawScriptUrl" }
+Check 'downloaded from main on raw.githubusercontent.com' { @(Get-Content -LiteralPath $log7) -ccontains "Invoke-WebRequest $RawScriptUrl" }
 Check 'installed script byte-identical to repo script' { Same-Bytes "$H\.claude\statusline-command.sh" $RepoScript }
 Check 'settings.json statusLine equals contract value' { (JqCanon '.statusLine' "$H\.claude\settings.json") -ceq $ExpectedSL }
-Set-Content -LiteralPath $NetLog -Value $null
 
 Write-Host '8. piped install failure throws instead of closing the PowerShell session'
 $H = New-Home 8
-Install-Into $H @{ PATH = $noJq } -Piped
+$log8 = Join-Path $Work 'net8.log'; $null = New-Item -ItemType File -Path $log8
+Install-Into $H @{ PATH = $noJq; CSL_NET_LOG = $log8 } -Piped
 Check 'fails non-zero' { $rc -ne 0 }
 Check 'session still alive after the failure (no exit)' { $out.Contains('CSL-HOST-ALIVE') }
 Check 'message names winget install jqlang.jq' { $out.Contains('winget install jqlang.jq') }
 Check 'nothing created' { Is-Empty $H }
-Check 'no download attempted' { -not (Get-Content -LiteralPath $NetLog) }
+Check 'no download attempted' { -not (Get-Content -LiteralPath $log8) }
 
 Write-Host '9. install.ps1 source'
 Check 'ASCII only (5.1 reads BOM-less scripts in the ANSI code page)' { -not ([IO.File]::ReadAllBytes($Installer) | Where-Object { $_ -gt 127 }) }
@@ -269,7 +295,7 @@ Check 'parses without errors' {
     $errs = $null; $null = [Management.Automation.Language.Parser]::ParseFile($Installer, [ref]$null, [ref]$errs); $errs.Count -eq 0
 }
 
-Write-Host 'guard: no network calls outside test 7'
+Write-Host 'guard: no network calls outside tests 7 and 8'
 Check 'Invoke-WebRequest/Invoke-RestMethod stubs never called' { -not (Get-Content -LiteralPath $NetLog) }
 
 Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
