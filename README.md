@@ -91,6 +91,24 @@ Flags such as `--width`, `--sections`, `--time` and `--layout` are passed in the
 `statusLine.command` string in `settings.json`; see the header of
 `statusline-command.sh` for the full list.
 
+### Context denominator (autocompact window)
+
+The context section shows `used/total`, a % and a bar. `total` is the autocompact window
+when you have set one, else the model's context window from the payload. The window is the
+first valid value from:
+
+1. `CLAUDE_CODE_AUTO_COMPACT_WINDOW` in the environment (a positive integer, clamped to
+   100000–1000000 as Claude Code does);
+2. `autoCompactWindow` in `<project>/.claude/settings.local.json`;
+3. `autoCompactWindow` in `<project>/.claude/settings.json`;
+4. `autoCompactWindow` in `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`)
+   — where `/autocompact <n>` writes it.
+
+`<project>` is the payload's `workspace.project_dir`, else `$CLAUDE_PROJECT_DIR`. A missing
+file, invalid JSON, or a value that is not a positive integer is skipped silently. The
+window never exceeds the model's context window, and `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`
+still scales it. Managed settings and the `--settings` flag are not read.
+
 ## Platform support
 
 | Platform | Status line | Install / uninstall | Usage refresh credential |
