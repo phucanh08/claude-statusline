@@ -34,6 +34,30 @@ bash install.sh
 Run from a file, the installer copies the `statusline-command.sh` next to it instead of
 downloading.
 
+### Windows (PowerShell)
+
+In Windows PowerShell 5.1 or PowerShell 7:
+
+```powershell
+irm https://raw.githubusercontent.com/phucanh08/claude-statusline/main/install.ps1 | iex
+```
+
+(or `powershell -ExecutionPolicy Bypass -File install.ps1` from a clone). It does what
+`install.sh` does, to `%USERPROFILE%\.claude`, and needs:
+
+- **jq** — `winget install jqlang.jq`;
+- **Git for Windows** — `winget install Git.Git`. Claude Code runs the status line through
+  Git Bash, so the installer stops if it cannot find `<git root>\bin\bash.exe`
+  (`install.ps1:27-51`). It looks at `CLAUDE_CODE_GIT_BASH_PATH` if set (Claude Code's own
+  override; then only that file counts), else the Git that `git.exe` on `PATH` belongs to,
+  else `Git` under Program Files or `%LOCALAPPDATA%\Programs`. A `bash.exe` on `PATH` alone
+  does not count (`C:\Windows\System32\bash.exe` is WSL's). A Git installed by Scoop is
+  **not** detected (its `git.exe` is a shim); set `CLAUDE_CODE_GIT_BASH_PATH` to its
+  `bin\bash.exe`, e.g. `%USERPROFILE%\scoop\apps\git\current\bin\bash.exe`.
+
+After installing jq or Git, open a new PowerShell window so `PATH` is refreshed. Under
+`irm | iex` a failure throws an error and leaves your PowerShell window open.
+
 ## Uninstall
 
 ```sh
@@ -51,6 +75,16 @@ curl -fsSL https://raw.githubusercontent.com/phucanh08/claude-statusline/main/un
 
 Running it when nothing is installed does nothing.
 
+On Windows, from PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/phucanh08/claude-statusline/main/uninstall.ps1 | iex
+```
+
+(or `powershell -ExecutionPolicy Bypass -File uninstall.ps1` from a clone). Same rules as
+above, applied to `%USERPROFILE%\.claude`; it needs jq but not Git Bash. If
+`settings.json` is not a JSON object, both uninstallers stop without changing anything.
+
 ## Options
 
 Flags such as `--width`, `--sections`, `--time` and `--layout` are passed in the
@@ -64,8 +98,8 @@ Flags such as `--width`, `--sections`, `--time` and `--layout` are passed in the
 | macOS | yes | `curl … \| bash` | Keychain, else `~/.claude/.credentials.json` |
 | Linux (glibc or busybox/musl) | yes | `curl … \| bash` (needs `bash`) | `~/.claude/.credentials.json` |
 | Windows, WSL | yes (it is Linux) | run inside WSL | the WSL `~/.claude/.credentials.json` |
-| Windows, native with Git for Windows | yes, via Git Bash | run the one-liner in Git Bash | `%USERPROFILE%\.claude\.credentials.json` |
-| Windows, native without Git Bash | no | — | — |
+| Windows, native with Git for Windows | yes, via Git Bash | `irm … \| iex` in PowerShell, or the `curl` one-liner in Git Bash | `%USERPROFILE%\.claude\.credentials.json` |
+| Windows, native without Git Bash | no | `install.ps1` stops and prints `winget install Git.Git`; `uninstall.ps1` works | — |
 
 Notes:
 
@@ -147,6 +181,19 @@ The suite runs in GitHub Actions on Ubuntu, macOS and Windows (Git Bash), the la
 once with `core.autocrlf=false` and once with `true` —
 `.github/workflows/test.yml`. `.gitattributes` keeps every file LF on checkout, so a
 Windows clone with Git's default `core.autocrlf=true` still passes.
+
+`install.ps1` and `uninstall.ps1` have their own suite:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File test/run.ps1   # or pwsh
+```
+
+Each run is a child PowerShell with a throwaway `USERPROFILE` and `Invoke-WebRequest`
+stubbed, so it never touches the network or your real `.claude`. It needs jq and Git for
+Windows. CI runs it on Windows PowerShell 5.1 and PowerShell 7, plus a mutation job: it
+breaks a copy of `install.ps1` or `uninstall.ps1` one way at a time (e.g. removing any
+`statusLine`, deleting backups, writing a BOM, `exit` under `irm | iex`) and requires the
+tests named for that breakage to fail.
 
 ## License
 
