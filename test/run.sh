@@ -85,6 +85,10 @@ check "same files, same content, no new backups" '[ "$before" = "$after" ]'
 
 ESC=$(printf '\033')
 plain() { sed "s/${ESC}\[[0-9;]*m//g"; }
+# The autocompact window is read from these variables and from settings.json under the
+# project dir and CLAUDE_CONFIG_DIR; renders clear them so the caller's own setup (e.g. a
+# run inside Claude Code) can't change the output.
+NO_ACW="CLAUDE_CONFIG_DIR= CLAUDE_PROJECT_DIR= CLAUDE_CODE_AUTO_COMPACT_WINDOW= CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="
 # Render a golden case: test/golden/NAME.json on stdin, optional NAME.args as flags,
 # NAME.cache.json (else an empty one) as a fresh usage cache so no refresh starts.
 # Fixed TZ (POSIX form, needs no tzdata) and far-future resets keep it deterministic.
@@ -93,7 +97,7 @@ golden() {
     if [ -f "$GOLD/$2.cache.json" ]; then cp "$GOLD/$2.cache.json" "$g/.cache/claude-statusline/usage.json"
     else echo '{"limits":[]}' > "$g/.cache/claude-statusline/usage.json"; fi
     args=""; [ -f "$GOLD/$2.args" ] && args=$(cat "$GOLD/$2.args")
-    (cd "$g" && HOME="$g" TMPDIR="$g/tmp" TZ=JST-9 COLUMNS=200 PATH="$BASE_PATH" \
+    (cd "$g" && HOME="$g" TMPDIR="$g/tmp" TZ=JST-9 COLUMNS=200 PATH="$BASE_PATH" env $NO_ACW \
         bash "$1" $args < "$GOLD/$2.json")
 }
 CASES=$(cd "$GOLD" && ls *.json | grep -v '\.cache\.json$' | sed 's/\.json$//')
@@ -139,7 +143,7 @@ if [ "$OS" = mac ]; then
 }
 EOF
         for mode in reset remaining elapsed; do
-            live() { (cd "$H" && HOME="$H" TMPDIR="$H/tmp" COLUMNS=200 PATH="$BASE_PATH" \
+            live() { (cd "$H" && HOME="$H" TMPDIR="$H/tmp" COLUMNS=200 PATH="$BASE_PATH" env $NO_ACW \
                 bash "$1" --time "$mode" < "$WORK/live.json"); }
             live "$SCRIPT" > "$WORK/live.new"; live "$WORK/base.sh" > "$WORK/live.base"
             check "live --time $mode: identical to base" '[ -s "$WORK/live.new" ] && cmp -s "$WORK/live.new" "$WORK/live.base"'
@@ -416,6 +420,124 @@ refresh "$H" Darwin CLAUDE_CONFIG_DIR="$H/cfg"
 check "curl sent the CLAUDE_CONFIG_DIR token" 'grep -q "Authorization: Bearer tok-cfg-c10" "$CRED_LOG"'
 check "~/.claude token not used" '! grep -q tok-home-c10 "$CRED_LOG"'
 check "token in no file under HOME" '[ -z "$(leaks "$H" tok-cfg-c10)" ]'
+
+# ---- context denominator: the autocompact window ----
+# acw_render SIZE PROJECT [VAR=value ...]: the context section alone (compact, escapes
+# stripped) for 50k tokens used and context_window_size SIZE, in the fake HOME $A_HOME.
+# PROJECT is the payload's .workspace.project_dir ("" = no workspace). Stderr goes to
+# $WORK/acw.err. Expected values are worked by hand: 50k of 200k = 25%, of 300k = 17%.
+ACW_LAYOUT=compact; ACW_FILTER=plain
+A_HOME=$(new_home acw); A_PROJ="$WORK/proj.acw"; A_PROJ2="$WORK/proj2.acw"
+mkdir -p "$A_HOME/tmp" "$A_HOME/.cache/claude-statusline" "$A_PROJ" "$A_PROJ2"
+acw_render() {
+    _size="$1"; _proj="$2"; shift 2
+    _ws=""; [ -n "$_proj" ] && _ws=", \"workspace\": { \"project_dir\": \"$_proj\" }"
+    echo '{"limits":[]}' > "$A_HOME/.cache/claude-statusline/usage.json"   # fresh: no refresh
+    printf '{ "context_window": { "total_input_tokens": 45000, "total_output_tokens": 5000, "context_window_size": %s }%s }' \
+        "$_size" "$_ws" | (cd "$A_HOME" && env HOME="$A_HOME" TMPDIR="$A_HOME/tmp" COLUMNS=200 \
+        PATH="$BASE_PATH" $NO_ACW "$@" bash "$SCRIPT" --sections context --layout "$ACW_LAYOUT" 2>"$WORK/acw.err") | $ACW_FILTER
+}
+# acw_is EXPECTED NAME SIZE PROJECT [VAR=value ...]
+acw_is() { _want="$1"; _name="$2"; shift 2; _got=$(acw_render "$@")
+    check "$_name -> '$_want'" '[ "$_got" = "$_want" ] || { echo "       got: [$_got]"; false; }'; }
+# acw_set FILE [JSON]: write FILE (dirs created); no JSON = remove it.
+acw_set() { if [ $# -ge 2 ]; then mkdir -p "$(dirname "$1")"; printf '%s\n' "$2" > "$1"; else rm -f "$1"; fi; }
+A_USER="$A_HOME/.claude/settings.json"
+A_LOCAL="$A_PROJ/.claude/settings.local.json"
+A_SHARED="$A_PROJ/.claude/settings.json"
+
+echo "A1. no autocompact window anywhere -> denominator is context_window_size, unchanged"
+acw_is "50k/200k 25%" "no files" 200000 "$A_PROJ"
+none=$(acw_render 1000000 "$A_PROJ")
+acw_set "$A_USER" '{"theme":"dark","env":{"FOO":"bar"}}'
+acw_set "$A_SHARED" '{"permissions":{"allow":[]}}'
+acw_set "$A_LOCAL" '{}'
+check "settings files without the key: output unchanged" '[ -n "$none" ] && [ "$(acw_render 1000000 "$A_PROJ")" = "$none" ]'
+check "  ... and nothing on stderr" '[ ! -s "$WORK/acw.err" ]'
+acw_is "" "context_window_size 0, no window: context hidden" 0 "$A_PROJ"
+
+echo "A2. settings precedence: local > project > user"
+acw_set "$A_USER" '{"theme":"dark","autoCompactWindow":250000}'
+acw_set "$A_SHARED" '{"autoCompactWindow":200000}'
+acw_set "$A_LOCAL" '{"autoCompactWindow":150000}'
+acw_is "50k/150k 33%" "local beats project and user" 1000000 "$A_PROJ"
+acw_set "$A_LOCAL"
+acw_is "50k/200k 25%" "project beats user" 1000000 "$A_PROJ"
+acw_set "$A_SHARED"
+acw_is "50k/250k 20%" "user settings.json" 1000000 "$A_PROJ"
+acw_is "50k/250k 20%" "no project dir: user settings.json only" 1000000 ""
+
+echo "A3. project dir: payload .workspace.project_dir, else CLAUDE_PROJECT_DIR"
+acw_set "$A_SHARED" '{"autoCompactWindow":200000}'
+acw_set "$A_PROJ2/.claude/settings.json" '{"autoCompactWindow":300000}'
+acw_is "50k/200k 25%" "CLAUDE_PROJECT_DIR used when the payload has none" 1000000 "" CLAUDE_PROJECT_DIR="$A_PROJ"
+acw_is "50k/300k 17%" "payload project_dir beats CLAUDE_PROJECT_DIR" 1000000 "$A_PROJ2" CLAUDE_PROJECT_DIR="$A_PROJ"
+acw_set "$A_SHARED"
+
+echo "A4. CLAUDE_CONFIG_DIR moves the user settings.json"
+acw_set "$A_HOME/cfg/settings.json" '{"autoCompactWindow":400000}'
+acw_is "50k/400k 13%" "CLAUDE_CONFIG_DIR/settings.json, not ~/.claude" 1000000 "" CLAUDE_CONFIG_DIR="$A_HOME/cfg"
+acw_set "$A_HOME/cfg/settings.json"
+
+echo "A5. env CLAUDE_CODE_AUTO_COMPACT_WINDOW beats every settings file"
+acw_set "$A_LOCAL" '{"autoCompactWindow":150000}'
+acw_is "50k/300k 17%" "env beats local, project and user" 1000000 "$A_PROJ" CLAUDE_CODE_AUTO_COMPACT_WINDOW=300000
+acw_is "50k/300k 17%" "leading zeros are decimal, not octal" 1000000 "$A_PROJ" CLAUDE_CODE_AUTO_COMPACT_WINDOW=0300000
+acw_set "$A_LOCAL"
+
+echo "A6. env clamped to 100000..1000000"
+acw_is "50k/100k 50%" "env 50000 -> 100k" 1000000 "" CLAUDE_CODE_AUTO_COMPACT_WINDOW=50000
+acw_is "50k/100k 50%" "env 1 -> 100k" 1000000 "" CLAUDE_CODE_AUTO_COMPACT_WINDOW=1
+acw_is "50k/1000k 5%" "env 5000000 -> 1000k (model window 2M)" 2000000 "" CLAUDE_CODE_AUTO_COMPACT_WINDOW=5000000
+acw_is "50k/1000k 5%" "env 99999999999999999999 -> 1000k" 2000000 "" CLAUDE_CODE_AUTO_COMPACT_WINDOW=99999999999999999999
+
+echo "A7. effective window = min(window, context_window_size)"
+acw_is "50k/200k 25%" "env 500000, model window 200k -> 200k" 200000 "" CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000
+acw_set "$A_USER" '{"autoCompactWindow":400000}'
+acw_is "50k/200k 25%" "settings 400000, model window 200k -> 200k" 200000 ""
+acw_set "$A_USER" '{"autoCompactWindow":99999999999999999999}'
+acw_is "50k/200k 25%" "settings 1e20, model window 200k -> 200k" 200000 ""
+acw_set "$A_USER" '{"autoCompactWindow":300000}'
+acw_is "50k/300k 17%" "context_window_size 0 -> the window itself" 0 ""
+acw_is "50k/300k 17%" "context_window_size missing -> the window itself" null ""
+
+echo "A8. invalid env / settings values and invalid JSON fall through, silently"
+for v in abc "" 0 000 -5 1.5 " 300000"; do
+    acw_is "50k/300k 17%" "env [$v] skipped" 1000000 "" CLAUDE_CODE_AUTO_COMPACT_WINDOW="$v"
+    check "  ... and nothing on stderr" '[ ! -s "$WORK/acw.err" ]'
+done
+acw_set "$A_SHARED" '{"autoCompactWindow":200000}'
+for bad in '{"autoCompactWindow":' 'not json' '["autoCompactWindow",150000]' '{"autoCompactWindow":"150000"}' \
+           '{"autoCompactWindow":0}' '{"autoCompactWindow":-150000}' '{"autoCompactWindow":150000.5}' \
+           '{"autoCompactWindow":null}' '{"autoCompactWindow":true}' ''; do
+    acw_set "$A_LOCAL" "$bad"
+    acw_is "50k/200k 25%" "local [$bad] skipped -> project" 1000000 "$A_PROJ"
+    check "  ... and nothing on stderr" '[ ! -s "$WORK/acw.err" ]'
+done
+acw_set "$A_LOCAL"; acw_set "$A_SHARED" 'not json'
+acw_is "50k/300k 17%" "invalid project JSON -> user" 1000000 "$A_PROJ"
+acw_set "$A_SHARED"; acw_set "$A_USER" 'not json'
+acw_is "50k/1000k 5%" "invalid user JSON -> context_window_size" 1000000 "$A_PROJ"
+check "  ... and nothing on stderr" '[ ! -s "$WORK/acw.err" ]'
+mkdir -p "$A_PROJ/.claude/settings.local.json"
+acw_set "$A_USER" '{"autoCompactWindow":300000}'
+acw_is "50k/300k 17%" "settings path that is a directory -> skipped" 1000000 "$A_PROJ"
+check "  ... and nothing on stderr" '[ ! -s "$WORK/acw.err" ]'
+rmdir "$A_PROJ/.claude/settings.local.json"
+
+echo "A9. the bar follows the window too: a 200k window on a 1M model == a 200k model"
+# Raw output: filled and track cells differ only in their color escapes.
+ACW_LAYOUT=expanded; ACW_FILTER=cat
+acw_set "$A_USER" '{"autoCompactWindow":200000}'
+w200=$(acw_render 1000000 ""); acw_set "$A_USER"; m200=$(acw_render 200000 ""); m1m=$(acw_render 1000000 "")
+check "expanded text + bar byte-identical to a 200k model" '[ -n "$w200" ] && [ "$w200" = "$m200" ]'
+check "  ... and its bar differs from the 1M model's" '[ "$(echo "$w200" | sed -n 2p)" != "$(echo "$m1m" | sed -n 2p)" ]'
+ACW_LAYOUT=compact; ACW_FILTER=plain
+acw_set "$A_USER" '{"autoCompactWindow":300000}'
+
+echo "A10. CLAUDE_AUTOCOMPACT_PCT_OVERRIDE still scales the denominator"
+acw_is "50k/150k 33%" "settings 300000 x 50%" 1000000 "" CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=50
+acw_set "$A_USER"
 
 echo "guard: no network / Keychain calls"
 check "curl/security stubs never called" '[ ! -s "$NET_LOG" ]'

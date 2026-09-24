@@ -9,7 +9,7 @@
 #                    payload carries such a bucket in .rate_limits (see ASSUMPTION below)
 #   - week reset date as dd/MM, xhigh shown as "XHigh", default width 20
 #   - responsive drop order: fable, then branch, then from the right
-#   - context total honors CLAUDE_CODE_AUTO_COMPACT_WINDOW / CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
+#   - context total = autocompact window (env or settings.json) x CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
 #   Line 1 (dim):  context used/total %  |  5hr % reset  |  week % reset  [ | Branch | Model ]
 #   Line 2:        per-cell green->red progress bar under each segment   [ | branch | model name ]
 #
@@ -93,19 +93,19 @@ esac
 # ---- context window (tokens) ----
 total_input=$(printf '%s' "$input"  | jq -r '.context_window.total_input_tokens // 0')
 total_output=$(printf '%s' "$input" | jq -r '.context_window.total_output_tokens // 0')
-ctx_size=$(printf '%s' "$input"     | jq -r '.context_window.context_window_size // 0')
+ctx_line=$(printf '%s' "$input"    | jq -r '"\(.context_window.context_window_size // 0)\t\(.workspace.project_dir // "")"')
+ctx_size="${ctx_line%%	*}"; proj_dir="${ctx_line#*	}"   # project dir: for the settings lookup below
 case "$total_input"  in *[!0-9]*|"") total_input=0 ;; esac
 case "$total_output" in *[!0-9]*|"") total_output=0 ;; esac
 case "$ctx_size"     in *[!0-9]*|"") ctx_size=0 ;; esac
 total=$((total_input + total_output))
-# Show the autocompact limit as the denominator when the user configured one.
-case "$CLAUDE_CODE_AUTO_COMPACT_WINDOW" in *[!0-9]*|"") ;; *) ctx_size="$CLAUDE_CODE_AUTO_COMPACT_WINDOW" ;; esac
-case "$CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" in *[!0-9]*|"") ;; *) ctx_size=$(( ctx_size * CLAUDE_AUTOCOMPACT_PCT_OVERRIDE / 100 )) ;; esac
-
-if [ "$ctx_size" -gt 0 ]; then
-    tok_pct=$(( (total * 100 + ctx_size / 2) / ctx_size ))
-else
-    tok_pct=0
+# Autocompact window from the env: a positive integer (leading zeros dropped: not octal),
+# clamped to 100000..1000000 as Claude Code does; else see "context denominator" below.
+acw="$CLAUDE_CODE_AUTO_COMPACT_WINDOW"; case "$acw" in *[!0-9]*) acw="" ;; esac
+while case "$acw" in 0*) true ;; *) false ;; esac; do acw="${acw#0}"; done
+if [ -n "$acw" ]; then
+    if [ "${#acw}" -gt 7 ] || [ "$acw" -gt 1000000 ]; then acw=1000000
+    elif [ "$acw" -lt 100000 ]; then acw=100000; fi
 fi
 
 # ---- rate limits (absent for API-key sessions / before first response) ----
@@ -401,6 +401,40 @@ pct_color() {
         printf "%s[22m%s[38;2;%d;%d;0m", esc, esc, int(r * br + 0.5), int(g * br + 0.5);
     }'
 }
+
+# ---- context denominator: the effective autocompact window ----
+# `/autocompact <n>` writes autoCompactWindow to settings.json, not to the env, and the
+# payload has no autocompact field. So without the env value (above), take the first
+# positive integer autoCompactWindow from the settings files Claude Code merges, highest
+# precedence first: <project>/.claude/settings.local.json, <project>/.claude/settings.json,
+# then the user's settings.json. <project> is the payload's .workspace.project_dir, else
+# $CLAUDE_PROJECT_DIR. A missing file, bad JSON or a missing / non-integer / <=0 value
+# falls through quietly; one jq per file that exists. Managed settings are not read.
+if [ -z "$acw" ]; then
+    [ -n "$proj_dir" ] || proj_dir="$CLAUDE_PROJECT_DIR"
+    set -- "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+    [ -n "$proj_dir" ] && set -- "$proj_dir/.claude/settings.local.json" "$proj_dir/.claude/settings.json" "$@"
+    for f in "$@"; do
+        [ -f "$f" ] || continue
+        acw=$(jq -r '.autoCompactWindow? | select(type == "number" and . > 0 and . == floor) | floor' "$f" 2>/dev/null)
+        case "$acw" in *[!0-9]*|"") acw="" ;; *) break ;; esac
+    done
+fi
+# The window can't exceed the model's (min, compared by length first: no overflow).
+if [ -n "$acw" ]; then
+    if [ "$ctx_size" -gt 0 ] && { [ "${#acw}" -gt "${#ctx_size}" ] ||
+         { [ "${#acw}" -eq "${#ctx_size}" ] && [ "$acw" -gt "$ctx_size" ]; }; }; then
+        acw="$ctx_size"
+    fi
+    ctx_size="$acw"
+fi
+case "$CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" in *[!0-9]*|"") ;; *) ctx_size=$(( ctx_size * CLAUDE_AUTOCOMPACT_PCT_OVERRIDE / 100 )) ;; esac
+
+if [ "$ctx_size" -gt 0 ]; then
+    tok_pct=$(( (total * 100 + ctx_size / 2) / ctx_size ))
+else
+    tok_pct=0
+fi
 
 # Decide which requested sections to show, preserving requested order.
 # The 5hr/week rate sections always show once requested: with no data yet (new
