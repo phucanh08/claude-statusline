@@ -45,3 +45,140 @@ jobs:
           jq --version
       - name: Test suite
         run: sh test/run.sh
+
+  # install.ps1 on both Windows PowerShell 5.1 and PowerShell 7.
+  install-ps1:
+    name: install.ps1 (windows-latest, ${{ matrix.shell }})
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tool versions
+        run: |
+          $PSVersionTable.PSVersion.ToString()
+          Get-Command jq, git -CommandType Application | Format-Table Name, Source -AutoSize
+          jq --version
+      - name: Test suite
+        run: ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File test/run.ps1
+
+  # The suite must catch a broken installer: each mutation of install.ps1 has to make the
+  # named tests fail. Run on 5.1, where the encoding traps live.
+  install-ps1-mutations:
+    name: install.ps1 tests catch broken installers (windows-latest, powershell)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v7
+      - name: Each mutation turns its tests red
+        run: |
+          # name, edits (find, replace, find, replace, ...), tests that must FAIL
+          $mutations = @(
+            @{ name = 'always download, even from a clone'
+               edits = @('$sourceDir = if ($fromFile) { Split-Path -Parent $CommandPath } else { '''' }', '$sourceDir = ''''')
+               fails = @('installer exits 0', 'Invoke-WebRequest/Invoke-RestMethod stubs never called') }
+            @{ name = 'download fails'
+               edits = @('Invoke-WebRequest -UseBasicParsing -Uri "$RawUrl/statusline-command.sh" -OutFile $newScript', 'throw ''no download''')
+               fails = @('downloaded from main on raw.githubusercontent.com', '  FAIL settings.json statusLine equals contract value') }
+            @{ name = 'download from another branch'
+               edits = @('claude-statusline/main''', 'claude-statusline/master''')
+               fails = @('downloaded from main on raw.githubusercontent.com') }
+            @{ name = 'different statusLine value'
+               edits = @('"command":"bash ~/.claude/statusline-command.sh"}''', '"command":"bash ~/.claude/statusline-command.sh --x"}''')
+               fails = @('fresh settings.json statusLine equals contract value', '  FAIL statusLine equals contract value', '  FAIL settings.json statusLine equals contract value') }
+            @{ name = 'settings.json written with a BOM'
+               edits = @('[IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding $false))', '[IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding $true))')
+               fails = @('fresh settings.json has no BOM', 'rewritten settings.json has no BOM') }
+            @{ name = 'jq CRLF kept'
+               edits = @('Out = $out.Replace("`r`n", "`n")', 'Out = $out')
+               fails = @('fresh settings.json has LF line endings', 'rewritten settings.json has LF line endings') }
+            @{ name = 'jq output decoded in the console code page'
+               edits = @('$psi.StandardOutputEncoding = New-Object System.Text.UTF8Encoding $false', '')
+               fails = @('every other key keeps its value', 'unicode written as UTF-8 text') }
+            @{ name = 'settings.json round-tripped through ConvertTo-Json'
+               edits = @('Write-Utf8NoBom $Settings $r.Out', 'Write-Utf8NoBom $Settings ($r.Out | ConvertFrom-Json | ConvertTo-Json)')
+               fails = @('every other key keeps its value') }
+            @{ name = 'settings.json rebuilt instead of edited'
+               edits = @('set      = ".statusLine = $StatusLine"', 'set      = "{statusLine: $StatusLine}"')
+               fails = @('every other key keeps its value', 'unicode written as UTF-8 text') }
+            @{ name = 'script written as text with a BOM'
+               edits = @('[IO.File]::WriteAllBytes($Script, $bytes)', '[IO.File]::WriteAllText($Script, [IO.File]::ReadAllText($newScript), (New-Object System.Text.UTF8Encoding $true))')
+               fails = @('  FAIL installed script byte-identical to repo script', 'script replaced, byte-identical to repo script', 'same files, same content, same mtimes, no new backups', 'CLAUDE_CODE_GIT_BASH_PATH to Git''s bash.exe: installs') }
+            @{ name = 'no settings.json backup'
+               edits = @('Copy-Item -LiteralPath $Settings -Destination "$Settings.bak.$Stamp"', '')
+               fails = @('settings backup holds original bytes') }
+            @{ name = 'no script backup'
+               edits = @('Copy-Item -LiteralPath $Script -Destination "$Script.bak.$Stamp"', '')
+               fails = @('script backup holds original') }
+            @{ name = 'script rewritten even when unchanged'
+               edits = @('-ceq [Convert]::ToBase64String($bytes)', '-ceq ''never''')
+               fails = @('same files, same content, same mtimes, no new backups') }
+            @{ name = 'settings.json not validated, script written first'
+               edits = @('if ((Invoke-Jq $jq ''-e'', ''-f'', $filters.isObject, $Settings).Code -ne 0) {', 'if ($false) {',
+                         '# ---- validate settings.json before touching anything ----', '$null = New-Item -ItemType Directory -Force -Path $ClaudeDir; [IO.File]::WriteAllBytes($Script, [IO.File]::ReadAllBytes($newScript))')
+               fails = @('broken: message names settings.json', 'broken: nothing changed or created', 'array: message names settings.json', 'array: nothing changed or created') }
+            @{ name = 'failure exits 0'
+               edits = @('exit 1', 'exit 0')
+               fails = @('broken: fails non-zero', 'array: fails non-zero', '  FAIL fails non-zero', 'fails non-zero (seeded)') }
+            @{ name = 'no jq check, script written before validation'
+               edits = @('if (-not $jq) {', 'if ($false) {',
+                         '# ---- validate settings.json before touching anything ----', '$null = New-Item -ItemType Directory -Force -Path $ClaudeDir; [IO.File]::WriteAllBytes($Script, [IO.File]::ReadAllBytes($newScript))')
+               fails = @('message names winget install jqlang.jq', 'empty USERPROFILE: nothing created', 'seeded USERPROFILE: files unchanged') }
+            @{ name = 'no Git Bash check, script written before validation'
+               edits = @('if (-not (Find-GitBash)) {', 'if ($false) {',
+                         '# ---- validate settings.json before touching anything ----', '$null = New-Item -ItemType Directory -Force -Path $ClaudeDir; [IO.File]::WriteAllBytes($Script, [IO.File]::ReadAllBytes($newScript))')
+               fails = @('message names winget install Git.Git', 'empty USERPROFILE: nothing created', 'seeded USERPROFILE: files unchanged', 'CLAUDE_CODE_GIT_BASH_PATH to a missing file: fails, nothing created') }
+            @{ name = 'any bash.exe on PATH counts as Git Bash (WSL)'
+               edits = @('function Find-GitBash {', 'function Find-GitBash { $b = Get-Command bash.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; if ($b) { return $b.Path }')
+               fails = @('message names winget install Git.Git', 'empty USERPROFILE: nothing created') }
+            @{ name = 'CLAUDE_CODE_GIT_BASH_PATH ignored'
+               edits = @('if ($env:CLAUDE_CODE_GIT_BASH_PATH) {', 'if ($false) {')
+               fails = @('CLAUDE_CODE_GIT_BASH_PATH to Git''s bash.exe: installs') }
+            @{ name = 'CLAUDE_CODE_GIT_BASH_PATH not checked'
+               edits = @('if ((Test-Path -LiteralPath $p -PathType Leaf) -and', 'if ((1) -and')
+               fails = @('CLAUDE_CODE_GIT_BASH_PATH to a missing file: fails, nothing created') }
+            @{ name = 'exit instead of throw under irm | iex'
+               edits = @('if (-not $fromFile) { throw }', 'if (-not $fromFile) { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }')
+               fails = @('session still alive after the failure (no exit)') }
+            @{ name = 'non-ASCII character'
+               edits = @('# Keep this file ASCII', ('# Keep this file ASCII ' + [char]0xE9))
+               fails = @('ASCII only') }
+            @{ name = 'syntax error'
+               edits = @('Invoke-ClaudeStatusLineInstall $PSCommandPath', 'Invoke-ClaudeStatusLineInstall $PSCommandPath }')
+               fails = @('parses without errors') }
+          )
+          $src = [IO.File]::ReadAllText("$PWD\install.ps1")
+          $bad = 0
+          foreach ($m in $mutations) {
+            $dir = Join-Path $env:RUNNER_TEMP ('mut-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            $null = New-Item -ItemType Directory -Path $dir
+            Copy-Item statusline-command.sh $dir
+            $text = $src; $applied = $true
+            for ($i = 0; $i -lt $m.edits.Count; $i += 2) {
+              if (-not $text.Contains($m.edits[$i])) { $applied = $false; Write-Host "::error::$($m.name): pattern not found: $($m.edits[$i])" }
+              $text = $text.Replace($m.edits[$i], $m.edits[$i + 1])
+            }
+            if (-not $applied) { $bad++; continue }
+            [IO.File]::WriteAllText("$dir\install.ps1", $text)
+            $log = (& powershell -NoProfile -ExecutionPolicy Bypass -File test\run.ps1 -Installer "$dir\install.ps1") | Out-String
+            $code = $LASTEXITCODE
+            # Every expected name must be on a FAIL line.
+            $failLines = @(($log -split "`n") | Where-Object { $_.Contains('  FAIL ') })
+            $notRed = @($m.fails | Where-Object { $f = $_; -not @($failLines | Where-Object { $_.Contains($f) }).Count })
+            if ($code -eq 0 -or $notRed.Count) {
+              $bad++
+              Write-Host "::error::mutation '$($m.name)' not caught (exit $code; not red: $($notRed -join ' | '))"
+              Write-Host $log
+            } else {
+              Write-Host "caught: $($m.name) (exit $code)"
+              ($log -split "`n") | Where-Object { $_.Contains('  FAIL ') } | ForEach-Object { Write-Host "    $_" }
+            }
+          }
+          if ($bad) { exit 1 }
