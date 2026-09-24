@@ -184,4 +184,6 @@ jobs:
               ($log -split "`n") | Where-Object { $_.Contains('  FAIL ') } | ForEach-Object { Write-Host "    $_" }
             }
           }
+          # The runner's wrapper would otherwise exit with the last mutated run's code.
           if ($bad) { exit 1 }
+          exit 0
