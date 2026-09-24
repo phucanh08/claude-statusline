@@ -48,7 +48,7 @@ jobs:
 
   # install.ps1 on both Windows PowerShell 5.1 and PowerShell 7.
   install-ps1:
-    name: install.ps1 (windows-latest, ${{ matrix.shell }})
+    name: install.ps1 + uninstall.ps1 (windows-latest, ${{ matrix.shell }})
     strategy:
       fail-fast: false
       matrix:
@@ -67,10 +67,10 @@ jobs:
       - name: Test suite
         run: ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File test/run.ps1
 
-  # The suite must catch a broken installer: each mutation of install.ps1 has to make the
-  # named tests fail. Run on 5.1, where the encoding traps live.
+  # The suite must catch a broken script: each mutation of install.ps1 or uninstall.ps1 has
+  # to make the named tests fail. Run on 5.1, where the encoding traps live.
   install-ps1-mutations:
-    name: install.ps1 tests catch broken installers (windows-latest, powershell)
+    name: run.ps1 catches broken install.ps1 / uninstall.ps1 (windows-latest, powershell)
     runs-on: windows-latest
     defaults:
       run:
@@ -79,7 +79,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Each mutation turns its tests red
         run: |
-          # name, edits (find, replace, find, replace, ...), tests that must FAIL
+          # install.ps1: name, edits (find, replace, find, replace, ...), tests that must FAIL
+          # (a substring of a FAIL line that is not an uninstall test)
           $mutations = @(
             @{ name = 'always download, even from a clone'
                edits = @('$sourceDir = if ($fromFile) { Split-Path -Parent $CommandPath } else { '''' }', '$sourceDir = ''''')
@@ -154,34 +155,114 @@ jobs:
                edits = @('Invoke-ClaudeStatusLineInstall $PSCommandPath', 'Invoke-ClaudeStatusLineInstall $PSCommandPath }')
                fails = @('parses without errors') }
           )
-          $src = [IO.File]::ReadAllText("$PWD\install.ps1")
+          # uninstall.ps1: tests that must FAIL, by full name
+          $uMutations = @(
+            @{ name = 'any statusLine removed'
+               edits = @('if ((Invoke-Jq $jq ''-e'', ''-f'', $filters.isOurs, $Settings).Code -eq 0) {', 'if ($true) {')
+               fails = @('U2 foreign: settings.json unchanged', 'U2 near-miss: settings.json unchanged') }
+            @{ name = 'statusLine matched on its command only'
+               edits = @('isOurs   = ".statusLine == $StatusLine"', 'isOurs   = ".statusLine.command == ($StatusLine).command"')
+               fails = @('U2 near-miss: settings.json unchanged') }
+            @{ name = 'different statusLine value'
+               edits = @('"command":"bash ~/.claude/statusline-command.sh"}''', '"command":"bash ~/.claude/statusline-command.sh --x"}''')
+               fails = @('U1 statusLine removed', 'U7 statusLine removed', 'U8 statusLine removed') }
+            @{ name = 'modified script removed'
+               edits = @('if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($Script)) -ceq', 'if ($true -or [Convert]::ToBase64String([IO.File]::ReadAllBytes($Script)) -ceq')
+               fails = @('U3 modified script kept unchanged', 'U8b script that differs from the one on main is kept') }
+            @{ name = 'script never removed'
+               edits = @('Remove-Item -LiteralPath $Script -Force', '')
+               fails = @('U1 script removed', 'U1 only settings.json and the backups are left', 'U7 script removed', 'U8 script removed') }
+            @{ name = 'settings.json backup restored'
+               edits = @('foreach ($b in $backups) { Write-Host "  $($b.FullName)" }', 'foreach ($b in $backups) { Write-Host "  $($b.FullName)"; if ($b.Name -like ''settings.json.bak.*'') { Move-Item -LiteralPath $b.FullName -Destination $Settings -Force } }')
+               fails = @('U1 statusLine removed', 'U1 only settings.json and the backups are left', 'U1 backups untouched') }
+            @{ name = 'backups deleted'
+               edits = @('foreach ($b in $backups) { Write-Host "  $($b.FullName)" }', 'foreach ($b in $backups) { Write-Host "  $($b.FullName)"; Remove-Item -LiteralPath $b.FullName -Force }')
+               fails = @('U1 only settings.json and the backups are left', 'U1 backups untouched') }
+            @{ name = 'backups not listed'
+               edits = @('foreach ($b in $backups) { Write-Host "  $($b.FullName)" }', '')
+               fails = @('U1 backup paths printed') }
+            @{ name = 'settings.json not validated'
+               edits = @('(Invoke-Jq $jq ''-e'', ''-f'', $filters.isObject, $Settings).Code -ne 0) {', '$false) {')
+               fails = @('U5 broken: fails non-zero', 'U5 broken: message names settings.json', 'U5 broken: nothing changed (script kept too)',
+                         'U5 array: fails non-zero', 'U5 array: message names settings.json', 'U5 array: nothing changed (script kept too)') }
+            @{ name = 'script removed before the checks'
+               edits = @('$jq = Get-Command jq -CommandType Application', 'Remove-Item -LiteralPath $Script -Force -ErrorAction SilentlyContinue; $jq = Get-Command jq -CommandType Application')
+               fails = @('U3 modified script kept unchanged', 'U5 broken: nothing changed (script kept too)', 'U6 nothing changed', 'U9 nothing changed') }
+            @{ name = 'no jq check'
+               edits = @('if (-not $jq) {', 'if ($false) {')
+               fails = @('U6 message names winget install jqlang.jq', 'U9 message names winget install jqlang.jq') }
+            @{ name = 'Git Bash required'
+               edits = @('$jq = Get-Command jq -CommandType Application', 'if (-not (Test-Path -LiteralPath "$env:ProgramFiles\Git\bin\bash.exe")) { throw ''claude-statusline: Git Bash is required'' }; $jq = Get-Command jq -CommandType Application')
+               fails = @('U7 uninstaller exits 0 without Git Bash', 'U7 script removed', 'U7 statusLine removed') }
+            @{ name = 'failure exits 0'
+               edits = @('exit 1', 'exit 0')
+               fails = @('U5 broken: fails non-zero', 'U5 array: fails non-zero', 'U6 fails non-zero') }
+            @{ name = 'exit instead of throw under irm | iex'
+               edits = @('if (-not $fromFile) { throw }', 'if (-not $fromFile) { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }')
+               fails = @('U9 session still alive after the failure (no exit)') }
+            @{ name = 'always download, even from a clone'
+               edits = @('$sourceDir = if ($fromFile) { Split-Path -Parent $CommandPath } else { '''' }', '$sourceDir = ''''')
+               fails = @('U1 uninstaller exits 0', 'Invoke-WebRequest/Invoke-RestMethod stubs never called') }
+            @{ name = 'download from another branch'
+               edits = @('claude-statusline/main''', 'claude-statusline/master''')
+               fails = @('U8 downloaded from main on raw.githubusercontent.com') }
+            @{ name = 'settings.json rewritten when it has no statusLine'
+               edits = @('Write-Host ''No statusLine in settings.json; nothing to remove.''', 'if (Test-Path -LiteralPath $Settings) { Write-Utf8NoBom $Settings (Invoke-Jq $jq ''-f'', $filters.remove, $Settings).Out }')
+               fails = @('U4 second run: nothing changed (content and mtimes)') }
+            @{ name = 'settings.json written with a BOM'
+               edits = @('[IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding $false))', '[IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding $true))')
+               fails = @('U1 settings.json has no BOM') }
+            @{ name = 'jq CRLF kept'
+               edits = @('Out = $out.Replace("`r`n", "`n")', 'Out = $out')
+               fails = @('U1 settings.json has LF line endings') }
+            @{ name = 'jq output decoded in the console code page'
+               edits = @('$psi.StandardOutputEncoding = New-Object System.Text.UTF8Encoding $false', '')
+               fails = @('U1 every other key keeps its value', 'U1 unicode written as UTF-8 text') }
+            @{ name = 'settings.json round-tripped through ConvertTo-Json'
+               edits = @('Write-Utf8NoBom $Settings $r.Out', 'Write-Utf8NoBom $Settings ($r.Out | ConvertFrom-Json | ConvertTo-Json)')
+               fails = @('U1 every other key keeps its value') }
+            @{ name = 'non-ASCII character'
+               edits = @('# Keep this file ASCII', ('# Keep this file ASCII ' + [char]0xE9))
+               fails = @('U10 ASCII only') }
+            @{ name = 'syntax error'
+               edits = @('Invoke-ClaudeStatusLineUninstall $PSCommandPath', 'Invoke-ClaudeStatusLineUninstall $PSCommandPath }')
+               fails = @('U10 parses without errors') }
+          )
+          foreach ($m in $mutations) { $m.target = 'install.ps1' }
+          foreach ($m in $uMutations) { $m.target = 'uninstall.ps1' }
           # The unmutated suite must be green, or a pre-existing FAIL would pass for a catch.
           $log = (& powershell -NoProfile -ExecutionPolicy Bypass -File test\run.ps1) | Out-String
           if ($LASTEXITCODE -ne 0) { Write-Host $log; Write-Host '::error::suite is red before any mutation'; exit 1 }
           $bad = 0
-          foreach ($m in $mutations) {
+          foreach ($m in $mutations + $uMutations) {
             $dir = Join-Path $env:RUNNER_TEMP ('mut-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
             $null = New-Item -ItemType Directory -Path $dir
             Copy-Item statusline-command.sh $dir
-            $text = $src; $applied = $true
+            $text = [IO.File]::ReadAllText("$PWD\$($m.target)"); $applied = $true
             for ($i = 0; $i -lt $m.edits.Count; $i += 2) {
-              if (-not $text.Contains($m.edits[$i])) { $applied = $false; Write-Host "::error::$($m.name): pattern not found: $($m.edits[$i])" }
+              if (-not $text.Contains($m.edits[$i])) { $applied = $false; Write-Host "::error::$($m.target) $($m.name): pattern not found: $($m.edits[$i])" }
               $text = $text.Replace($m.edits[$i], $m.edits[$i + 1])
             }
             if (-not $applied) { $bad++; continue }
-            [IO.File]::WriteAllText("$dir\install.ps1", $text)
-            $log = (& powershell -NoProfile -ExecutionPolicy Bypass -File test\run.ps1 -Installer "$dir\install.ps1") | Out-String
+            [IO.File]::WriteAllText("$dir\$($m.target)", $text)
+            $flag = if ($m.target -eq 'install.ps1') { '-Installer' } else { '-Uninstaller' }
+            $log = (& powershell -NoProfile -ExecutionPolicy Bypass -File test\run.ps1 $flag "$dir\$($m.target)") | Out-String
             $code = $LASTEXITCODE
-            # Every expected name must be on a FAIL line.
-            $failLines = @(($log -split "`n") | Where-Object { $_.Contains('  FAIL ') })
-            $notRed = @($m.fails | Where-Object { $f = $_; -not @($failLines | Where-Object { $_.Contains($f) }).Count })
+            $failLines = @(($log -split "`n") | ForEach-Object { $_.TrimEnd() } | Where-Object { $_.StartsWith('  FAIL ') })
+            if ($m.target -eq 'install.ps1') {
+              # An install test name may be part of an uninstall test name (U<n> ...).
+              $failLines = @($failLines | Where-Object { $_ -notmatch '^  FAIL U\d' })
+              $notRed = @($m.fails | Where-Object { $f = $_; -not @($failLines | Where-Object { $_.Contains($f) }).Count })
+            } else {
+              $notRed = @($m.fails | Where-Object { $failLines -notcontains "  FAIL $_" })
+            }
             if ($code -eq 0 -or $notRed.Count) {
               $bad++
-              Write-Host "::error::mutation '$($m.name)' not caught (exit $code; not red: $($notRed -join ' | '))"
+              Write-Host "::error::$($m.target) mutation '$($m.name)' not caught (exit $code; not red: $($notRed -join ' | '))"
               Write-Host $log
             } else {
-              Write-Host "caught: $($m.name) (exit $code)"
-              ($log -split "`n") | Where-Object { $_.Contains('  FAIL ') } | ForEach-Object { Write-Host "    $_" }
+              Write-Host "caught: $($m.target) $($m.name) (exit $code)"
+              $failLines | ForEach-Object { Write-Host "    $_" }
             }
           }
           # The runner's wrapper would otherwise exit with the last mutated run's code.
