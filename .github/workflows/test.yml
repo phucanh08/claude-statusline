@@ -155,7 +155,7 @@ jobs:
                edits = @('Invoke-ClaudeStatusLineInstall $PSCommandPath', 'Invoke-ClaudeStatusLineInstall $PSCommandPath }')
                fails = @('parses without errors') }
           )
-          # uninstall.ps1: tests that must FAIL, by full name
+          # uninstall.ps1: tests that must FAIL, by the start of their name
           $uMutations = @(
             @{ name = 'any statusLine removed'
                edits = @('if ((Invoke-Jq $jq ''-e'', ''-f'', $filters.isOurs, $Settings).Code -eq 0) {', 'if ($true) {')
@@ -254,7 +254,7 @@ jobs:
               $failLines = @($failLines | Where-Object { $_ -notmatch '^  FAIL U\d' })
               $notRed = @($m.fails | Where-Object { $f = $_; -not @($failLines | Where-Object { $_.Contains($f) }).Count })
             } else {
-              $notRed = @($m.fails | Where-Object { $failLines -notcontains "  FAIL $_" })
+              $notRed = @($m.fails | Where-Object { $f = "  FAIL $_"; -not @($failLines | Where-Object { $_.StartsWith($f) }).Count })
             }
             if ($code -eq 0 -or $notRed.Count) {
               $bad++

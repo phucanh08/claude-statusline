@@ -316,6 +316,22 @@ function Seed-Installed([string]$H) {
     Install-Into $H
     if ($rc -ne 0) { Write-Host "       (install failed: $out)" }
 }
+# What the installers leave in an empty home, written directly (after U1) so that a broken
+# installer in the install mutations cannot break the uninstall tests' setup.
+$SeedSettings = @'
+{
+  "theme": "dark",
+  "statusLine": {
+    "type": "command",
+    "command": "bash ~/.claude/statusline-command.sh"
+  }
+}
+'@
+function Seed-Files([string]$H) {
+    $null = New-Item -ItemType Directory -Force -Path "$H\.claude"
+    Copy-Item -LiteralPath $RepoScript -Destination "$H\.claude\statusline-command.sh"
+    [IO.File]::WriteAllText("$H\.claude\settings.json", $SeedSettings.Replace("`r`n", "`n") + "`n", $Utf8)
+}
 
 Write-Host 'U1. install -> uninstall removes exactly what install added'
 $H = New-Home u1; $null = New-Item -ItemType Directory -Path "$H\.claude"
@@ -358,7 +374,7 @@ foreach ($case in @(
 
 Write-Host 'U3. a modified script is kept'
 $H = New-Home u3
-Seed-Installed $H
+Seed-Files $H
 [IO.File]::AppendAllText("$H\.claude\statusline-command.sh", "# my tweak`n")
 Copy-Item -LiteralPath "$H\.claude\statusline-command.sh" -Destination "$Work\script.u3"
 Uninstall-From $H
@@ -372,9 +388,8 @@ $H = New-Home u4
 Uninstall-From $H
 Check 'U4 empty home: exits 0' { $rc -eq 0 }
 Check 'U4 empty home: nothing created' { Is-Empty $H }
-$H = New-Home u4b; $null = New-Item -ItemType Directory -Path "$H\.claude"
-[IO.File]::WriteAllText("$H\.claude\settings.json", '{"theme":"dark"}', $Utf8)
-Seed-Installed $H; Uninstall-From $H
+$H = New-Home u4b
+Seed-Files $H; Uninstall-From $H
 $before = Snapshot $H
 Uninstall-From $H
 Check 'U4 second run: exits 0' { $rc -eq 0 }
@@ -383,7 +398,7 @@ Check 'U4 second run: nothing changed (content and mtimes)' { (Snapshot $H) -ceq
 Write-Host 'U5. settings.json not a JSON object -> refuse, nothing touched'
 foreach ($case in @(@('broken', '{"theme": "dark",'), @('array', '["not", "an", "object"]'))) {
     $H = New-Home "u5$($case[0])"
-    Seed-Installed $H
+    Seed-Files $H
     [IO.File]::WriteAllText("$H\.claude\settings.json", $case[1], $Utf8)
     $before = Snapshot $H
     Uninstall-From $H
@@ -394,7 +409,7 @@ foreach ($case in @(@('broken', '{"theme": "dark",'), @('array', '["not", "an", 
 
 Write-Host 'U6. jq missing -> install hint, nothing touched'
 $H = New-Home u6
-Seed-Installed $H
+Seed-Files $H
 $before = Snapshot $H
 Uninstall-From $H @{ PATH = $noJq }
 Check 'U6 fails non-zero' { $rc -ne 0 }
@@ -403,7 +418,7 @@ Check 'U6 nothing changed' { (Snapshot $H) -ceq $before }
 
 Write-Host 'U7. Git Bash is not needed to uninstall'
 $H = New-Home u7
-Seed-Installed $H
+Seed-Files $H
 Uninstall-From $H $noGit
 Check 'U7 uninstaller exits 0 without Git Bash' { $rc -eq 0 }
 Check 'U7 script removed' { -not (Test-Path -LiteralPath "$H\.claude\statusline-command.sh") }
@@ -411,7 +426,7 @@ Check 'U7 statusLine removed' { -not (Has-StatusLine "$H\.claude\settings.json")
 
 Write-Host 'U8. piped uninstall (irm | iex) compares against the script downloaded from main'
 $H = New-Home u8
-Seed-Installed $H
+Seed-Files $H
 $logU8 = Join-Path $Work 'net-u8.log'; $null = New-Item -ItemType File -Path $logU8
 Uninstall-From $H @{ CSL_SERVE = $RepoScript; CSL_NET_LOG = $logU8 } -Piped
 Check 'U8 uninstaller exits 0' { $rc -eq 0 }
@@ -420,7 +435,7 @@ Check 'U8 script removed' { -not (Test-Path -LiteralPath "$H\.claude\statusline-
 Check 'U8 statusLine removed' { -not (Has-StatusLine "$H\.claude\settings.json") }
 # main serves a newer script than the one installed: the installed copy no longer matches.
 $H = New-Home u8b
-Seed-Installed $H
+Seed-Files $H
 [IO.File]::WriteAllText("$Work\newer.sh", [IO.File]::ReadAllText($RepoScript) + "# newer`n", $Utf8)
 Copy-Item -LiteralPath "$H\.claude\statusline-command.sh" -Destination "$Work\script.u8b"
 $logU8b = Join-Path $Work 'net-u8b.log'; $null = New-Item -ItemType File -Path $logU8b
@@ -429,7 +444,7 @@ Check 'U8b script that differs from the one on main is kept' { $rc -eq 0 -and (S
 
 Write-Host 'U9. piped uninstall failure throws instead of closing the PowerShell session'
 $H = New-Home u9
-Seed-Installed $H
+Seed-Files $H
 $before = Snapshot $H
 $logU9 = Join-Path $Work 'net-u9.log'; $null = New-Item -ItemType File -Path $logU9
 Uninstall-From $H @{ PATH = $noJq; CSL_NET_LOG = $logU9 } -Piped
