@@ -1,20 +1,23 @@
-# Test runner for install.ps1. Every install runs in a child process of the same PowerShell
-# (5.1 or 7) against a fake USERPROFILE/HOME under the temp dir, with Invoke-WebRequest
-# stubbed: the real ~\.claude and the network are never touched.
+# Test runner for install.ps1 and uninstall.ps1. Every run is a child process of the same
+# PowerShell (5.1 or 7) against a fake USERPROFILE/HOME under the temp dir, with
+# Invoke-WebRequest stubbed: the real ~\.claude and the network are never touched.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File test\run.ps1
 #   pwsh -NoProfile -File test/run.ps1
 #
-# -Installer runs the suite against another copy of install.ps1 (it needs
-# statusline-command.sh next to it); CI uses it to check that broken installers fail.
+# -Installer / -Uninstaller run the suite against other copies of install.ps1 / uninstall.ps1
+# (they need statusline-command.sh next to them); CI uses them to check that broken
+# scripts fail.
 # Keep this file ASCII (see install.ps1).
 
-param([string]$Installer)
+param([string]$Installer, [string]$Uninstaller)
 
 $ErrorActionPreference = 'Stop'
 $Repo = Split-Path -Parent $PSScriptRoot
 if (-not $Installer) { $Installer = Join-Path $Repo 'install.ps1' }
 $Installer = (Resolve-Path -LiteralPath $Installer).Path
+if (-not $Uninstaller) { $Uninstaller = Join-Path $Repo 'uninstall.ps1' }
+$Uninstaller = (Resolve-Path -LiteralPath $Uninstaller).Path
 $RepoScript = Join-Path $Repo 'statusline-command.sh'
 $RawScriptUrl = 'https://raw.githubusercontent.com/phucanh08/claude-statusline/main/statusline-command.sh'
 # `jq -S -a -c .statusLine` of the contract value (same as install.sh).
@@ -137,6 +140,7 @@ function Install-Into([string]$H, [hashtable]$Overrides = @{}, [switch]$Piped, [
 
 Write-Host "host: $HostExe (PowerShell $($PSVersionTable.PSVersion))"
 Write-Host "installer: $Installer"
+Write-Host "uninstaller: $Uninstaller"
 Write-Host "jq: $Jq"
 
 Write-Host '0. what the bare PowerShell host writes under USERPROFILE (ignored below)'
@@ -295,7 +299,153 @@ Check 'parses without errors' {
     $errs = $null; $null = [Management.Automation.Language.Parser]::ParseFile($Installer, [ref]$null, [ref]$errs); $errs.Count -eq 0
 }
 
-Write-Host 'guard: no network calls outside tests 7 and 8'
+# ---- uninstall.ps1 ----
+function Uninstall-From([string]$H, [hashtable]$Overrides = @{}, [switch]$Piped) {
+    $o = $Overrides.Clone(); $o.CSL_INSTALLER = $Uninstaller
+    Install-Into $H $o -Piped:$Piped
+}
+# Name, SHA-256 and mtime of every backup in $H\.claude.
+function Backup-Snapshot([string]$H) {
+    (@(Get-ChildItem -LiteralPath "$H\.claude" -Filter '*.bak.*' -Force | Sort-Object Name) | ForEach-Object {
+        $sha = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($_.FullName)))
+        "$($_.Name) $sha $($_.LastWriteTimeUtc.Ticks)"
+    }) -join "`n"
+}
+function Has-StatusLine([string]$File) { (JqCanon 'keys' $File).Contains('"statusLine"') }
+function Seed-Installed([string]$H) {
+    Install-Into $H
+    if ($rc -ne 0) { Write-Host "       (install failed: $out)" }
+}
+
+Write-Host 'U1. install -> uninstall removes exactly what install added'
+$H = New-Home u1; $null = New-Item -ItemType Directory -Path "$H\.claude"
+[IO.File]::WriteAllText("$H\.claude\settings.json", $fixture.Replace("`r`n", "`n"), $Utf8)
+[IO.File]::WriteAllText("$H\.claude\statusline-command.sh", "echo old`n", $Utf8)
+Copy-Item -LiteralPath "$H\.claude\settings.json" -Destination "$Work\settings.u1"
+Seed-Installed $H
+$bakBefore = Backup-Snapshot $H
+$bakNames = @(Get-ChildItem -LiteralPath "$H\.claude" -Filter '*.bak.*' | ForEach-Object { $_.Name })
+Uninstall-From $H
+Check 'U1 uninstaller exits 0' { $rc -eq 0 }
+Check 'U1 statusLine removed' { -not (Has-StatusLine "$H\.claude\settings.json") }
+Check 'U1 every other key keeps its value (nested, 1-element arrays, unicode, numbers, bool, null)' {
+    (JqCanon 'del(.statusLine)' "$H\.claude\settings.json") -ceq (JqCanon 'del(.statusLine)' "$Work\settings.u1")
+}
+Check 'U1 unicode written as UTF-8 text' { [IO.File]::ReadAllText("$H\.claude\settings.json", $Utf8).Contains("$emoji $viet") }
+Check 'U1 settings.json has no BOM' { -not (Has-Bom "$H\.claude\settings.json") }
+Check 'U1 settings.json has LF line endings' { -not ([IO.File]::ReadAllBytes("$H\.claude\settings.json") -contains 13) }
+Check 'U1 script removed' { -not (Test-Path -LiteralPath "$H\.claude\statusline-command.sh") }
+Check 'U1 two backups existed (precondition)' { $bakNames.Count -eq 2 }
+Check 'U1 only settings.json and the backups are left' {
+    $left = @(Get-ChildItem -LiteralPath "$H\.claude" -Force | ForEach-Object { $_.Name } | Sort-Object)
+    ($left -join ',') -ceq ((@('settings.json') + $bakNames | Sort-Object) -join ',')
+}
+Check 'U1 backups untouched' { (Backup-Snapshot $H) -ceq $bakBefore }
+Check 'U1 backup paths printed' { -not @($bakNames | Where-Object { -not $out.Contains(".claude\$_") }).Count }
+
+Write-Host 'U2. a statusLine that is not the installer value is kept'
+foreach ($case in @(
+        @('foreign', '{"theme":"dark","statusLine":{"type":"command","command":"sh ~/.claude/statusline-command.sh --width 20"}}'),
+        @('near-miss', '{"theme":"dark","statusLine":{"type":"command","command":"bash ~/.claude/statusline-command.sh","padding":0}}'))) {
+    $H = New-Home "u2$($case[0])"; $null = New-Item -ItemType Directory -Path "$H\.claude"
+    [IO.File]::WriteAllText("$H\.claude\settings.json", $case[1], $Utf8)
+    $before = Snapshot $H
+    Uninstall-From $H
+    Check "U2 $($case[0]): uninstaller exits 0" { $rc -eq 0 }
+    Check "U2 $($case[0]): settings.json unchanged" { (Snapshot $H) -ceq $before }
+    Check "U2 $($case[0]): says it kept statusLine" { $out.Contains('Kept statusLine') }
+}
+
+Write-Host 'U3. a modified script is kept'
+$H = New-Home u3
+Seed-Installed $H
+[IO.File]::AppendAllText("$H\.claude\statusline-command.sh", "# my tweak`n")
+Copy-Item -LiteralPath "$H\.claude\statusline-command.sh" -Destination "$Work\script.u3"
+Uninstall-From $H
+Check 'U3 uninstaller exits 0' { $rc -eq 0 }
+Check 'U3 modified script kept unchanged' { Same-Bytes "$H\.claude\statusline-command.sh" "$Work\script.u3" }
+Check 'U3 says it kept the script' { $out -match 'Kept .*statusline-command\.sh' }
+Check 'U3 statusLine still removed' { -not (Has-StatusLine "$H\.claude\settings.json") }
+
+Write-Host 'U4. empty home and a second run are no-ops'
+$H = New-Home u4
+Uninstall-From $H
+Check 'U4 empty home: exits 0' { $rc -eq 0 }
+Check 'U4 empty home: nothing created' { Is-Empty $H }
+$H = New-Home u4b; $null = New-Item -ItemType Directory -Path "$H\.claude"
+[IO.File]::WriteAllText("$H\.claude\settings.json", '{"theme":"dark"}', $Utf8)
+Seed-Installed $H; Uninstall-From $H
+$before = Snapshot $H
+Uninstall-From $H
+Check 'U4 second run: exits 0' { $rc -eq 0 }
+Check 'U4 second run: nothing changed (content and mtimes)' { (Snapshot $H) -ceq $before }
+
+Write-Host 'U5. settings.json not a JSON object -> refuse, nothing touched'
+foreach ($case in @(@('broken', '{"theme": "dark",'), @('array', '["not", "an", "object"]'))) {
+    $H = New-Home "u5$($case[0])"
+    Seed-Installed $H
+    [IO.File]::WriteAllText("$H\.claude\settings.json", $case[1], $Utf8)
+    $before = Snapshot $H
+    Uninstall-From $H
+    Check "U5 $($case[0]): fails non-zero" { $rc -ne 0 }
+    Check "U5 $($case[0]): message names settings.json" { $out -match 'not a valid JSON object' }
+    Check "U5 $($case[0]): nothing changed (script kept too)" { (Snapshot $H) -ceq $before }
+}
+
+Write-Host 'U6. jq missing -> install hint, nothing touched'
+$H = New-Home u6
+Seed-Installed $H
+$before = Snapshot $H
+Uninstall-From $H @{ PATH = $noJq }
+Check 'U6 fails non-zero' { $rc -ne 0 }
+Check 'U6 message names winget install jqlang.jq' { $out.Contains('winget install jqlang.jq') }
+Check 'U6 nothing changed' { (Snapshot $H) -ceq $before }
+
+Write-Host 'U7. Git Bash is not needed to uninstall'
+$H = New-Home u7
+Seed-Installed $H
+Uninstall-From $H $noGit
+Check 'U7 uninstaller exits 0 without Git Bash' { $rc -eq 0 }
+Check 'U7 script removed' { -not (Test-Path -LiteralPath "$H\.claude\statusline-command.sh") }
+Check 'U7 statusLine removed' { -not (Has-StatusLine "$H\.claude\settings.json") }
+
+Write-Host 'U8. piped uninstall (irm | iex) compares against the script downloaded from main'
+$H = New-Home u8
+Seed-Installed $H
+$logU8 = Join-Path $Work 'net-u8.log'; $null = New-Item -ItemType File -Path $logU8
+Uninstall-From $H @{ CSL_SERVE = $RepoScript; CSL_NET_LOG = $logU8 } -Piped
+Check 'U8 uninstaller exits 0' { $rc -eq 0 }
+Check 'U8 downloaded from main on raw.githubusercontent.com' { @(Get-Content -LiteralPath $logU8) -ccontains "Invoke-WebRequest $RawScriptUrl" }
+Check 'U8 script removed' { -not (Test-Path -LiteralPath "$H\.claude\statusline-command.sh") }
+Check 'U8 statusLine removed' { -not (Has-StatusLine "$H\.claude\settings.json") }
+# main serves a newer script than the one installed: the installed copy no longer matches.
+$H = New-Home u8b
+Seed-Installed $H
+[IO.File]::WriteAllText("$Work\newer.sh", [IO.File]::ReadAllText($RepoScript) + "# newer`n", $Utf8)
+Copy-Item -LiteralPath "$H\.claude\statusline-command.sh" -Destination "$Work\script.u8b"
+$logU8b = Join-Path $Work 'net-u8b.log'; $null = New-Item -ItemType File -Path $logU8b
+Uninstall-From $H @{ CSL_SERVE = "$Work\newer.sh"; CSL_NET_LOG = $logU8b } -Piped
+Check 'U8b script that differs from the one on main is kept' { $rc -eq 0 -and (Same-Bytes "$H\.claude\statusline-command.sh" "$Work\script.u8b") }
+
+Write-Host 'U9. piped uninstall failure throws instead of closing the PowerShell session'
+$H = New-Home u9
+Seed-Installed $H
+$before = Snapshot $H
+$logU9 = Join-Path $Work 'net-u9.log'; $null = New-Item -ItemType File -Path $logU9
+Uninstall-From $H @{ PATH = $noJq; CSL_NET_LOG = $logU9 } -Piped
+Check 'U9 fails non-zero' { $rc -ne 0 }
+Check 'U9 session still alive after the failure (no exit)' { $out.Contains('CSL-HOST-ALIVE') }
+Check 'U9 message names winget install jqlang.jq' { $out.Contains('winget install jqlang.jq') }
+Check 'U9 nothing changed' { (Snapshot $H) -ceq $before }
+Check 'U9 no download attempted' { -not (Get-Content -LiteralPath $logU9) }
+
+Write-Host 'U10. uninstall.ps1 source'
+Check 'U10 ASCII only' { -not ([IO.File]::ReadAllBytes($Uninstaller) | Where-Object { $_ -gt 127 }) }
+Check 'U10 parses without errors' {
+    $errs = $null; $null = [Management.Automation.Language.Parser]::ParseFile($Uninstaller, [ref]$null, [ref]$errs); $errs.Count -eq 0
+}
+
+Write-Host 'guard: no network calls outside tests 7, 8, U8 and U9'
 Check 'Invoke-WebRequest/Invoke-RestMethod stubs never called' { -not (Get-Content -LiteralPath $NetLog) }
 
 Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
